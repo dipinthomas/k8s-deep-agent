@@ -1,0 +1,59 @@
+{
+  "_comment": "Resolution summary posted after successful evictions",
+  "channel": "#k8s-alerts",
+  "text": "✅ Incident resolved — disk pressure cleared",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": "✅  Incident Resolved",
+        "emoji": true
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Evictions completed:*\n✅ `loadgenerator` evicted\n✅ `imageprovider` evicted\n✅ `adservice` evicted"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Node disk usage:*\n91% → 67% (↓24%)"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Checkout p99 latency:*\n890ms → 118ms ✅ (back to normal)"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Payment service:*\nRunning, unaffected ✅"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Duration:*\n~2.5 minutes (alarm → resolution)"
+        }
+      ]
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "📝 *Writing incident to memory for future reference.*\n\n*Recommended follow-up actions:*\n• Add nginx log rotation config to `imageprovider` deployment\n• Set `NGINX_LOG_LEVEL=warn` as default in `otel-demo/values.yaml`\n• Add `ephemeral-storage` limit to `imageprovider` resources\n• Consider rate-limiting `loadgenerator` under disk pressure conditions\n• Add this pattern to disk-pressure skill playbook"
+      }
+    },
+    {
+      "type": "context",
+      "elements": [
+        {
+          "type": "mrkdwn",
+          "text": "Resolved at 2026-05-15T02:05:44Z · Root cause: imageprovider nginx NGINX_LOG_LEVEL=debug under high traffic"
+        }
+      ]
+    }
+  ]
+}

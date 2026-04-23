@@ -1,0 +1,58 @@
+// Simulated agent scripts used when NEXT_PUBLIC_USE_REAL_API is not "true"
+
+type ScriptEntry = { ms: number; type: string; [key: string]: unknown };
+
+export const DISK_SCRIPT: ScriptEntry[] = [
+  { ms: 400,  type: "agent",   text: "Incident received — node disk pressure on ip-10-0-1-45" },
+  { ms: 800,  type: "agent",   text: "Checkout p99 latency degrading: 120ms → 890ms" },
+  { ms: 1100, type: "agent",   text: "Spawning specialist subagents in parallel..." },
+  { ms: 1350, type: "spawn",   text: "▸ cloudwatch-agent  starting metric investigation" },
+  { ms: 1500, type: "spawn",   text: "▸ kubectl-agent      starting cluster state scan" },
+  { ms: 1650, type: "spawn",   text: "▸ otel-agent         starting trace analysis" },
+  { ms: 2300, type: "tool",   tool: "kubectl",    cmd: "get nodes",
+    result: "ip-10-0-1-45  Ready  DiskPressure=True  87% disk" },
+  { ms: 2900, type: "tool",   tool: "cloudwatch", cmd: "GetMetricData node_filesystem_utilization",
+    result: "15m trend: 71% → 79% → 87%  (rising fast)" },
+  { ms: 3500, type: "tool",   tool: "otel",       cmd: "GetMetricData checkoutservice.latency.p99",
+    result: "890ms  (baseline 120ms)  —  7.4× degradation" },
+  { ms: 4100, type: "hypo",   text: "Hypothesis 1 — OTel Collector emptyDir buffer overflow" },
+  { ms: 4700, type: "tool",   tool: "kubectl",    cmd: "describe pod otelcol-0 -n otel-demo",
+    result: "emptyDir: 2.1GB / 5.0GB (42%)  within limits" },
+  { ms: 5300, type: "tool",   tool: "cloudwatch", cmd: "GetMetricData otelcol_exporter_bytes",
+    result: "12.3 MB/min  (avg 11.8)  — normal range" },
+  { ms: 5900, type: "reject", text: "✗  Hypothesis 1 REJECTED — OTel Collector is healthy" },
+  { ms: 6300, type: "agent",  text: "Re-planning… checking imageprovider" },
+  { ms: 6800, type: "hypo",   text: "Hypothesis 2 — imageprovider nginx verbose logging" },
+  { ms: 7300, type: "tool",   tool: "kubectl",    cmd: "describe deploy/imageprovider -n otel-demo",
+    result: "NGINX_LOG_LEVEL=debug  ← MISCONFIGURATION" },
+  { ms: 7900, type: "tool",   tool: "cloudwatch", cmd: "GetMetricData container_fs_writes{imageprovider}",
+    result: "340.2 MB/8min  —  12× above baseline (28 MB)" },
+  { ms: 8500, type: "confirm",text: "✓  Root cause: imageprovider NGINX_LOG_LEVEL=debug" },
+  { ms: 9100, type: "tool",   tool: "kubectl",    cmd: "get pods -n otel-demo -o custom-columns=NAME,PRIORITY",
+    result: [
+      "checkoutservice   payment-critical  (1000000)  PROTECTED",
+      "paymentservice    payment-critical  (1000000)  PROTECTED",
+      "cartservice       payment-critical  (1000000)  PROTECTED",
+      "imageprovider     infrastructure    (900000)   CANDIDATE",
+      "adservice         background        (100000)   CANDIDATE",
+      "loadgenerator     background        (100000)   CANDIDATE",
+    ].join("\n") },
+  { ms: 9900, type: "approval" },
+];
+
+export const RESOLUTION_SCRIPT: ScriptEntry[] = [
+  { ms: 400,  type: "agent", text: "Approval received. Executing evictions..." },
+  { ms: 900,  type: "tool",  tool: "kubectl", cmd: 'delete pod loadgenerator-7d4f9-xxx -n otel-demo',
+    result: 'pod "loadgenerator-7d4f9-xxx" deleted ✓' },
+  { ms: 1500, type: "tool",  tool: "kubectl", cmd: 'delete pod imageprovider-5c8a2-xxx -n otel-demo',
+    result: 'pod "imageprovider-5c8a2-xxx" deleted ✓' },
+  { ms: 2100, type: "tool",  tool: "kubectl", cmd: 'delete pod adservice-3f7b1-xxx -n otel-demo',
+    result: 'pod "adservice-3f7b1-xxx" deleted ✓' },
+  { ms: 2700, type: "tool",  tool: "cloudwatch", cmd: "GetMetricData node_filesystem_utilization",
+    result: "87% → 61%  (↓ 26%)  pressure relieved ✓" },
+  { ms: 3300, type: "tool",  tool: "cloudwatch", cmd: "GetMetricData checkoutservice.latency.p99",
+    result: "890ms → 118ms  back to baseline ✓" },
+  { ms: 3900, type: "tool",  tool: "memory",     cmd: "store incident#2026-05-15-disk-pressure",
+    result: "saved: imageprovider debug logging → disk pressure" },
+  { ms: 4500, type: "resolved", text: "✓  Incident resolved  |  Node: 61%  |  Checkout p99: 118ms" },
+];

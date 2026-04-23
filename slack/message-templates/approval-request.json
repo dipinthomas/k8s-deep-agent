@@ -1,0 +1,90 @@
+{
+  "_comment": "Approval request with interactive buttons — agent pauses here waiting for human input",
+  "channel": "#k8s-alerts",
+  "text": "⚠️ Approval required: Pod eviction to resolve disk pressure",
+  "blocks": [
+    {
+      "type": "header",
+      "text": {
+        "type": "plain_text",
+        "text": "⚠️  Approval Required — Pod Eviction",
+        "emoji": true
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Root cause:*\n`imageprovider` nginx logging misconfiguration causing excessive disk writes under load generator traffic spike. Node disk at 91%, checkout service degraded."
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Evidence:*\n• Node disk usage: *91%* (threshold: 85%)\n• `imageprovider` disk writes: *340MB/8min* (normal: ~28MB/8min)\n• Checkout p99 latency: *890ms* (normal: 120ms)\n• OTel collector emptyDir: 87% — within normal range (not the cause)"
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Recommended evictions (lowest priority first):*\n1. `loadgenerator` — synthetic traffic, *zero user impact*\n2. `imageprovider` — product images unavailable, browsing affected\n3. `adservice` — ads stop showing, no revenue impact\n\n*Estimated disk recovery:* 91% → ~67% after all three evictions"
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "*Impact:*\n• Product browsing will be temporarily unavailable\n• Payments will continue to work normally\n• Evicted pods will reschedule once disk pressure clears"
+      }
+    },
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "✅ *Protected (NOT in eviction list):*\n• `checkoutservice` — payments continue\n• `paymentservice` — payment processing unaffected\n• `cartservice` — cart data preserved\n\n⚠️ *This will make product browsing unavailable. Payments will continue normally.*\n\nShall I proceed? @dipin"
+      }
+    },
+    {
+      "type": "divider"
+    },
+    {
+      "type": "actions",
+      "elements": [
+        {
+          "type": "button",
+          "text": {
+            "type": "plain_text",
+            "text": "✅ APPROVE",
+            "emoji": true
+          },
+          "style": "primary",
+          "action_id": "approve_eviction",
+          "value": "approve"
+        },
+        {
+          "type": "button",
+          "text": {
+            "type": "plain_text",
+            "text": "🚫 DENY",
+            "emoji": true
+          },
+          "style": "danger",
+          "action_id": "deny_eviction",
+          "value": "deny"
+        },
+        {
+          "type": "button",
+          "text": {
+            "type": "plain_text",
+            "text": "🔍 GIVE ME MORE DETAILS",
+            "emoji": true
+          },
+          "action_id": "more_details",
+          "value": "details"
+        }
+      ]
+    }
+  ]
+}

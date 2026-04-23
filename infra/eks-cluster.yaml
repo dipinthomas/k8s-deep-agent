@@ -1,0 +1,54 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: otel-demo-prod
+  region: ap-southeast-2
+  version: "1.29"
+  tags:
+    project: nz-tech-rally-demo
+    owner: dipin
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: standard-workers
+    instanceType: m5.2xlarge
+    minSize: 2
+    maxSize: 4
+    desiredCapacity: 3
+    volumeSize: 100
+    privateNetworking: true
+    labels:
+      role: worker
+    tags:
+      nodegroup-role: worker
+    iam:
+      attachPolicyARNs:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+cloudWatch:
+  clusterLogging:
+    enableTypes:
+      - api
+      - audit
+      - authenticator
+      - controllerManager
+      - scheduler
+
+addons:
+  - name: vpc-cni
+    version: latest
+  - name: coredns
+    version: latest
+  - name: kube-proxy
+    version: latest
+  - name: amazon-cloudwatch-observability
+    version: latest
+    attachPolicyARNs:
+      - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess

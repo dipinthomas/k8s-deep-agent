@@ -1,0 +1,53 @@
+# CloudWatch Container Insights configuration for EKS
+# Apply with: kubectl apply -f infra/cloudwatch-agent.yaml
+# This configures the CloudWatch agent deployed by the amazon-cloudwatch-observability addon
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amazon-cloudwatch-observability-config
+  namespace: amazon-cloudwatch
+data:
+  config.json: |
+    {
+      "agent": {
+        "region": "ap-southeast-2"
+      },
+      "logs": {
+        "metrics_collected": {
+          "kubernetes": {
+            "cluster_name": "otel-demo-prod",
+            "metrics_collection_interval": 30,
+            "enhanced_container_insights": true
+          }
+        },
+        "force_flush_interval": 5
+      },
+      "metrics": {
+        "namespace": "ContainerInsights",
+        "metrics_collected": {
+          "kubernetes": {
+            "cluster_name": "otel-demo-prod",
+            "metrics_collection_interval": 30
+          },
+          "disk": {
+            "measurement": [
+              "used_percent",
+              "used",
+              "total",
+              "inodes_used_percent"
+            ],
+            "metrics_collection_interval": 30,
+            "drop_original_metrics": ["disk_inodes_free"]
+          }
+        },
+        "append_dimensions": {
+          "ClusterName": "otel-demo-prod"
+        },
+        "aggregation_dimensions": [
+          ["ClusterName"],
+          ["ClusterName", "Namespace"],
+          ["ClusterName", "Namespace", "PodName"]
+        ]
+      }
+    }

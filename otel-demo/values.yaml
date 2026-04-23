@@ -1,0 +1,195 @@
+# Helm values for OpenTelemetry Demo
+# Customised for the NZ Tech Rally disk pressure demo scenario
+
+default:
+  # All pods inherit these resource settings unless overridden below
+  env:
+    - name: OTEL_SERVICE_NAME
+      valueFrom:
+        fieldRef:
+          apiVersion: v1
+          fieldPath: metadata.labels['app.kubernetes.io/component']
+    - name: OTEL_COLLECTOR_NAME
+      value: "otel-demo-otelcol"
+    - name: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+      value: cumulative
+    - name: OTEL_EXPORTER_OTLP_ENDPOINT
+      value: http://$(OTEL_COLLECTOR_NAME):4317
+    - name: OTEL_RESOURCE_ATTRIBUTES
+      value: "service.name=$(OTEL_SERVICE_NAME),service.namespace=otel-demo"
+
+components:
+  # CRITICAL — payment-critical priority class
+  checkoutService:
+    enabled: true
+    priorityClassName: payment-critical
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  paymentService:
+    enabled: true
+    priorityClassName: payment-critical
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  cartService:
+    enabled: true
+    priorityClassName: payment-critical
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  productCatalogService:
+    enabled: true
+    priorityClassName: user-facing
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 300m
+        memory: 256Mi
+
+  # USER-FACING
+  frontend:
+    enabled: true
+    priorityClassName: user-facing
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  frontendProxy:
+    enabled: true
+    priorityClassName: user-facing
+    service:
+      type: LoadBalancer
+
+  # INFRASTRUCTURE — imageprovider is the demo disk-pressure culprit
+  # NOTE: ephemeral-storage limit intentionally omitted to allow fault injection
+  imageprovider:
+    enabled: true
+    priorityClassName: infrastructure
+    env:
+      - name: NGINX_LOG_LEVEL
+        value: "warn"    # fault-injection script overrides this to "debug"
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+        # ephemeral-storage deliberately NOT set — fault injection patches this off
+
+  # BACKGROUND — safe to evict
+  adService:
+    enabled: true
+    priorityClassName: background
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+  recommendationService:
+    enabled: true
+    priorityClassName: background
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 300m
+        memory: 512Mi
+
+  # loadgenerator — always safe to stop, generates synthetic traffic
+  loadGenerator:
+    enabled: true
+    priorityClassName: background
+    env:
+      - name: LOCUST_USERS
+        value: "10"             # fault-injection raises this to 500
+      - name: LOCUST_SPAWN_RATE
+        value: "1"              # fault-injection raises this to 50
+      - name: LOCUST_HOST
+        value: http://otel-demo-frontendproxy:8080
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  # OTel Collector — writes trace buffers to emptyDir
+  # This is the WRONG HYPOTHESIS the agent checks first
+  opentelemetry-collector:
+    enabled: true
+    priorityClassName: infrastructure
+    resources:
+      requests:
+        cpu: 200m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  # Other services
+  emailService:
+    enabled: true
+    priorityClassName: background
+
+  shippingService:
+    enabled: true
+    priorityClassName: user-facing
+
+  currencyService:
+    enabled: true
+    priorityClassName: user-facing
+
+  quoteService:
+    enabled: true
+    priorityClassName: background
+
+  accountingService:
+    enabled: true
+    priorityClassName: background
+
+  frauddetectionService:
+    enabled: true
+    priorityClassName: background
+
+opentelemetry-collector:
+  config:
+    exporters:
+      awscloudwatch:
+        region: ap-southeast-2
+        namespace: OTelDemo
+      awsxray:
+        region: ap-southeast-2
+    service:
+      pipelines:
+        traces:
+          exporters: [awsxray, debug]
+        metrics:
+          exporters: [awscloudwatch, debug]

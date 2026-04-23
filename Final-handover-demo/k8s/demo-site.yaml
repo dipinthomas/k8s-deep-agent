@@ -1,0 +1,190 @@
+---
+# Namespace for the demo website itself
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-site
+
+---
+# ServiceAccount with read-only access to otel-demo namespace
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo-api
+  namespace: demo-site
+
+---
+# ClusterRole — read pods/nodes in otel-demo, delete pods for eviction
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: demo-api-role
+  namespace: otel-demo
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: demo-api-binding
+  namespace: otel-demo
+subjects:
+  - kind: ServiceAccount
+    name: demo-api
+    namespace: demo-site
+roleRef:
+  kind: Role
+  name: demo-api-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# FastAPI backend deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: demo-site
+  labels:
+    app: demo-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-api
+  template:
+    metadata:
+      labels:
+        app: demo-api
+    spec:
+      serviceAccountName: demo-api
+      containers:
+        - name: api
+          image: demo-api:latest   # replace with your ECR image
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8000
+          env:
+            - name: REAL_CLUSTER
+              value: "true"
+            - name: NAMESPACE
+              value: "otel-demo"
+            - name: CLUSTER_NAME
+              value: "otel-demo-prod"
+            - name: AWS_REGION
+              value: "ap-southeast-2"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-api
+  namespace: demo-site
+spec:
+  selector:
+    app: demo-api
+  ports:
+    - port: 8000
+      targetPort: 8000
+
+---
+# Next.js frontend deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-frontend
+  namespace: demo-site
+  labels:
+    app: demo-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-frontend
+  template:
+    metadata:
+      labels:
+        app: demo-frontend
+    spec:
+      containers:
+        - name: frontend
+          image: demo-frontend:latest   # replace with your ECR image
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3000
+          env:
+            - name: API_URL
+              value: "http://demo-api.demo-site.svc.cluster.local:8000"
+            - name: NEXT_PUBLIC_USE_REAL_API
+              value: "true"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-frontend
+  namespace: demo-site
+spec:
+  selector:
+    app: demo-frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+
+---
+# Ingress — routes demo.1conceptonline.com to the frontend
+# /api/* goes to the FastAPI backend directly for SSE support
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-ingress
+  namespace: demo-site
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:ap-southeast-2:ACCOUNT_ID:certificate/CERT_ID"
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # SSE requires longer idle timeout — default 60s will kill the stream
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+spec:
+  rules:
+    - host: demo.1conceptonline.com
+      http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-api
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-frontend
+                port:
+                  number: 3000
