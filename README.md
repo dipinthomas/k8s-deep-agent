@@ -6,6 +6,79 @@
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph INJECT["🔴 Fault Injection"]
+        FI["trigger-disk-pressure.sh\n• load-generator → 500 users\n• image-provider nginx → debug logging\n• fallocate 60 GB fill in pod"]
+    end
+
+    subgraph EKS["☸️ EKS Cluster — otel-demo-prod (ap-southeast-2)"]
+        direction TB
+        subgraph CRITICAL["payment-critical (priority 1,000,000)"]
+            CO["checkoutservice"]
+            PA["paymentservice"]
+            CA["cartservice"]
+        end
+        subgraph EVICTABLE["background (priority 100,000)"]
+            LG["load-generator"]
+            IP["image-provider 🔥\nnginx debug logs\n60 GB disk fill"]
+            AD["adservice"]
+        end
+        NODE["EKS Node\ndisk usage > 75%"]
+        IP --> NODE
+        LG --> NODE
+    end
+
+    subgraph OBS["📊 Observability"]
+        CI["CloudWatch\nContainer Insights\nnode_filesystem_utilization"]
+        ALARM["CloudWatch Alarm\nEKS-NodeDiskPressure-otel-demo-prod\n> 75% for 2 min"]
+        SNS["SNS Topic\neks-disk-pressure-alerts"]
+        LAMBDA["Lambda\neks-alarm-to-slack"]
+    end
+
+    subgraph SLACK["💬 Slack — #k8s-alerts"]
+        ALERT["⚠️ ALERT message\nDisk pressure detected"]
+        UPDATE1["🔍 Investigating...\nSubagents spawned"]
+        WRONG["❌ Wrong hypothesis\nOTel collector buffer at 87%"]
+        RIGHT["✅ Root cause found\nimageprovider nginx logs\n340 MB/8 min"]
+        APPROVAL["⚠️ Approval request\nEvict: loadgen → imageprovider → ad\nProtected: checkout ✓ payment ✓ cart ✓\n[APPROVE] [DENY]"]
+        RESOLVED["✅ Resolved\nDisk 91% → 67%\nCheckout p99 890ms → 118ms"]
+    end
+
+    subgraph AGENT["🤖 AI Agent (deepagents + LangGraph)"]
+        MASTER["Master Agent\nClaude claude-sonnet-4-6\nreads AGENTS.md + skills/"]
+        subgraph SUBAGENTS["Parallel Subagents"]
+            SA1["cloudwatch-investigator\ndisk metrics + logs"]
+            SA2["kubectl-investigator\nnode conditions + pod status"]
+            SA3["otel-investigator\ncheckout latency traces"]
+        end
+        INTERRUPT["LangGraph interrupt()\nstateful pause — waits for\nSlack approval"]
+        EVICT["kubectl evict\nloadgenerator ✓\nimageprovider ✓\nadservice ✓"]
+    end
+
+    FI -->|fills disk| IP
+    NODE -->|scraped every 60s| CI
+    CI --> ALARM
+    ALARM -->|SNS notification| SNS
+    SNS -->|triggers| LAMBDA
+    LAMBDA -->|POST chat.postMessage| ALERT
+
+    ALERT -->|wakes agent| MASTER
+    MASTER --> UPDATE1
+    MASTER --> SA1 & SA2 & SA3
+    SA1 & SA2 & SA3 -->|findings| MASTER
+    MASTER --> WRONG
+    MASTER --> RIGHT
+    MASTER --> APPROVAL
+    APPROVAL --> INTERRUPT
+    INTERRUPT -->|human clicks Approve| EVICT
+    EVICT --> RESOLVED
+```
+
+---
+
 ## What This Is
 
 A fully working AI agent demo that monitors an EKS cluster, autonomously investigates
