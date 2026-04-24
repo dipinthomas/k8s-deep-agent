@@ -30,12 +30,6 @@ cloudWatch:
       - scheduler
 
 addons:
-  - name: vpc-cni
-    version: latest
-  - name: coredns
-    version: latest
-  - name: kube-proxy
-    version: latest
   - name: amazon-cloudwatch-observability
     version: latest
     attachPolicyARNs:
