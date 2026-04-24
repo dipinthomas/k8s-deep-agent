@@ -28,6 +28,21 @@ kubectl patch deployment image-provider -n "$NAMESPACE" \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/resources/limits/ephemeral-storage","value":"500Mi"}]'
 echo "    ✓ ephemeral-storage limit restored to 500Mi"
 
+echo "==> Removing disk-fill file from image-provider (if still running)..."
+IMAGE_PROVIDER_POD=$(kubectl get pod -n "$NAMESPACE" \
+  -l app.kubernetes.io/name=image-provider \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
+  kubectl get pod -n "$NAMESPACE" \
+  -l app.kubernetes.io/component=image-provider \
+  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+if [[ -n "$IMAGE_PROVIDER_POD" ]]; then
+  kubectl exec "$IMAGE_PROVIDER_POD" -n "$NAMESPACE" -- \
+    sh -c 'rm -f /tmp/demo-disk-fill' 2>/dev/null || true
+  echo "    ✓ Disk-fill file removed (or pod already replaced)"
+else
+  echo "    ✓ No image-provider pod found — skipped (will be gone after restart)"
+fi
+
 echo "==> Restarting evicted deployments (if any)..."
 for deployment in image-provider ad recommendation load-generator; do
   if kubectl get deployment "$deployment" -n "$NAMESPACE" &>/dev/null; then
@@ -50,6 +65,6 @@ echo "✅ Cluster reset complete. Ready for next demo run."
 echo ""
 echo "Verify CloudWatch alarm cleared:"
 echo "  aws cloudwatch describe-alarms \\"
-echo "    --alarm-names EKS-NodeDiskPressure-otel-demo \\"
+echo "    --alarm-names EKS-NodeDiskPressure-otel-demo-prod \\"
 echo "    --region ap-southeast-2 \\"
 echo "    --query 'MetricAlarms[0].StateValue'"
