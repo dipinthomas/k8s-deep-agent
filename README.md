@@ -136,11 +136,19 @@ pip install -r requirements.txt
 
 ### 8. Start MCP Servers
 
+The agent uses direct Python tool implementations (boto3, kubectl, Slack SDK) by default.
+The MCP server definitions in `agent/mcp/servers.yaml` are provided for reference if you
+want to swap to an MCP-based tool layer.
+
 ```bash
-# In separate terminals (or use tmux):
-npx @modelcontextprotocol/server-kubernetes --port 3001
-npx @modelcontextprotocol/server-aws-cloudwatch --port 3002
-npx @modelcontextprotocol/server-slack --port 3003
+# Kubernetes MCP server (stdio)
+npx mcp-server-kubernetes
+
+# CloudWatch MCP server (Python — requires uvx)
+uvx awslabs.cloudwatch-mcp-server@latest
+
+# Slack MCP server (stdio)
+npx @modelcontextprotocol/server-slack
 ```
 
 ### 9. Run the Agent

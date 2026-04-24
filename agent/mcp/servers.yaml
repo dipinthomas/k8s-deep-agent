@@ -1,26 +1,27 @@
 # MCP server definitions
-# Start each server before running the agent:
-#   npx @modelcontextprotocol/server-kubernetes --port 3001
-#   npx @modelcontextprotocol/server-aws-cloudwatch --port 3002
-#   npx @modelcontextprotocol/server-slack --port 3003
+#
+# NOTE: The agent currently uses direct Python tool implementations in agent/tools/.
+# These MCP server definitions are provided for reference if you want to swap to
+# an MCP-based tool layer in future.
+#
+# Correct startup commands:
+#   npx mcp-server-kubernetes                     (stdio transport)
+#   uvx awslabs.cloudwatch-mcp-server@latest      (stdio transport, Python/uvx)
+#   npx @modelcontextprotocol/server-slack        (stdio transport)
 
 servers:
   kubectl-mcp:
     command: npx
     args:
-      - "@modelcontextprotocol/server-kubernetes"
-      - "--port"
-      - "${KUBECTL_MCP_PORT:-3001}"
+      - "mcp-server-kubernetes"
     env:
       KUBECONFIG: "${KUBECONFIG}"
     description: "Kubernetes cluster operations via kubectl"
 
   cloudwatch-mcp:
-    command: npx
+    command: uvx
     args:
-      - "@modelcontextprotocol/server-aws-cloudwatch"
-      - "--port"
-      - "${CLOUDWATCH_MCP_PORT:-3002}"
+      - "awslabs.cloudwatch-mcp-server@latest"
     env:
       AWS_REGION: "${AWS_REGION:-ap-southeast-2}"
       AWS_PROFILE: "${AWS_PROFILE:-default}"
@@ -30,8 +31,6 @@ servers:
     command: npx
     args:
       - "@modelcontextprotocol/server-slack"
-      - "--port"
-      - "${SLACK_MCP_PORT:-3003}"
     env:
       SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN}"
       SLACK_TEAM_ID: "${SLACK_TEAM_ID}"
