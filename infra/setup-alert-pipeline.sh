@@ -95,28 +95,45 @@ echo "==> Step 4: Deploying Lambda function '$LAMBDA_NAME'..."
 echo "    Waiting for IAM role to propagate..."
 sleep 10
 
-LAMBDA_ARN=$(aws lambda create-function \
-  --function-name "$LAMBDA_NAME" \
-  --runtime python3.12 \
-  --role "$LAMBDA_ROLE_ARN" \
-  --handler alarm-to-slack.lambda_handler \
-  --zip-file "fileb://$LAMBDA_ZIP" \
-  --environment "Variables={SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN},SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}}" \
-  --timeout 30 \
-  --region "$REGION" \
-  --query FunctionArn --output text 2>/dev/null \
-  || aws lambda update-function-code \
-       --function-name "$LAMBDA_NAME" \
-       --zip-file "fileb://$LAMBDA_ZIP" \
-       --region "$REGION" \
-       --query FunctionArn --output text)
+if aws lambda get-function --function-name "$LAMBDA_NAME" --region "$REGION" &>/dev/null; then
+  # Function exists — update code
+  echo "    Function exists, updating code..."
+  LAMBDA_ARN=$(aws lambda update-function-code \
+    --function-name "$LAMBDA_NAME" \
+    --zip-file "fileb://$LAMBDA_ZIP" \
+    --region "$REGION" \
+    --query FunctionArn --output text)
+else
+  # Create new function
+  LAMBDA_ARN=$(aws lambda create-function \
+    --function-name "$LAMBDA_NAME" \
+    --runtime python3.12 \
+    --role "$LAMBDA_ROLE_ARN" \
+    --handler alarm-to-slack.lambda_handler \
+    --zip-file "fileb://$LAMBDA_ZIP" \
+    --environment "Variables={SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN},SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}}" \
+    --timeout 30 \
+    --region "$REGION" \
+    --query FunctionArn --output text)
+fi
 
-# Update env vars in case they changed
+# Wait for code update/creation to finish
+echo "    Waiting for Lambda to be ready..."
+aws lambda wait function-updated \
+  --function-name "$LAMBDA_NAME" \
+  --region "$REGION"
+
+# Update env vars (covers both create path and update path)
 aws lambda update-function-configuration \
   --function-name "$LAMBDA_NAME" \
   --environment "Variables={SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN},SLACK_CHANNEL_ID=${SLACK_CHANNEL_ID}}" \
   --region "$REGION" \
   --output text --query FunctionArn >/dev/null
+
+# Wait for configuration update to finish before proceeding
+aws lambda wait function-updated \
+  --function-name "$LAMBDA_NAME" \
+  --region "$REGION"
 
 echo "    ✓ Lambda ARN: $LAMBDA_ARN"
 
