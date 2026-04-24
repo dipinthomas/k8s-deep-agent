@@ -49,7 +49,7 @@ def build_agent():
     store = build_memory_store()
 
     agent = create_deep_agent(
-        model="anthropic:claude-sonnet-4-6",
+        model="openai:gpt-4o",
         skills=["./skills/"],
         subagents=[cloudwatch_subagent, kubectl_subagent, otel_subagent],
         tools=[
