@@ -1,0 +1,114 @@
+# K8s AI Agent — deployment, RBAC, and service account
+# Apply with: kubectl apply -f infra/agent-deployment.yaml
+# Requires: infra/agent-secrets.yaml applied first (see agent-secrets.example.yaml)
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-agent
+  namespace: otel-demo
+
+---
+# Namespace-scoped permissions: full pod/log/event access in otel-demo
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-agent-role
+  namespace: otel-demo
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "patch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-agent-binding
+  namespace: otel-demo
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent
+  namespace: otel-demo
+roleRef:
+  kind: Role
+  name: k8s-agent-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Cluster-scoped: read nodes (needed for disk pressure checks)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-agent-node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-agent-node-reader
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent
+  namespace: otel-demo
+roleRef:
+  kind: ClusterRole
+  name: k8s-agent-node-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-agent
+  namespace: otel-demo
+  labels:
+    app: k8s-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-agent
+  template:
+    metadata:
+      labels:
+        app: k8s-agent
+    spec:
+      serviceAccountName: k8s-agent
+      containers:
+      - name: agent
+        image: dipinthomas/k8s-deep-agent:latest
+        imagePullPolicy: Always
+        envFrom:
+        - secretRef:
+            name: k8s-agent-secrets
+        env:
+        - name: AWS_REGION
+          value: "ap-southeast-2"
+        - name: CLUSTER_NAME
+          value: "otel-demo-prod"
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+      priorityClassName: infrastructure

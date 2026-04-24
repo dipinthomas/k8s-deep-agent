@@ -37,5 +37,8 @@ infra/.terraform.lock.hcl
 kubeconfig
 *.kubeconfig
 
+# Secrets — never commit
+infra/agent-secrets.yaml
+
 # Logs
 *.log

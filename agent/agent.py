@@ -3,20 +3,23 @@ Deep Agent setup for the K8s disk pressure demo.
 Uses LangGraph checkpointing for stateful pause/resume at the approval step.
 """
 
-import os
+import pathlib
 from deepagents import create_deep_agent
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
 
 from subagents import cloudwatch_subagent, kubectl_subagent, otel_subagent
 from tools.slack_tools import post_to_slack, post_approval_request
 from tools.kubectl_tools import kubectl_evict_pod, kubectl_drain_node, kubectl_delete
 from memory.store import build_memory_store
 
-SYSTEM_PROMPT = """
-You are an autonomous Kubernetes operations agent for the otel-demo-prod cluster (EKS ap-southeast-2).
+_AGENTS_MD = pathlib.Path(__file__).parent.parent / "AGENTS.md"
 
-ALWAYS start by reading AGENTS.md to understand the cluster, its services, priority classes, and rules.
+SYSTEM_PROMPT = """
+{agents_md}
+
+---
+
+You are an autonomous Kubernetes operations agent for the otel-demo-prod cluster (EKS ap-southeast-2).
 
 Investigation approach:
 1. Acknowledge the incident in Slack immediately.
@@ -35,10 +38,13 @@ Rules you must never break:
 - Never delete a PVC.
 - Always show evidence before asking for approval.
 - If unsure, ask — do not guess.
-""".strip()
+"""
 
 
 def build_agent():
+    agents_md = _AGENTS_MD.read_text() if _AGENTS_MD.exists() else ""
+    system_prompt = SYSTEM_PROMPT.format(agents_md=agents_md).strip()
+
     checkpointer = MemorySaver()
     store = build_memory_store()
 
@@ -46,17 +52,21 @@ def build_agent():
         model="anthropic:claude-sonnet-4-6",
         skills=["./skills/"],
         subagents=[cloudwatch_subagent, kubectl_subagent, otel_subagent],
-        tools=[post_to_slack, post_approval_request],
+        tools=[
+            post_to_slack,
+            post_approval_request,
+            kubectl_evict_pod,
+            kubectl_drain_node,
+            kubectl_delete,
+        ],
         checkpointer=checkpointer,
         store=store,
         interrupt_on={
-            # These tools require human approval before execution
             "kubectl_evict_pod": True,
             "kubectl_drain_node": True,
             "kubectl_delete": True,
         },
-        system_prompt=SYSTEM_PROMPT,
-        agents_file="./AGENTS.md",
+        system_prompt=system_prompt,
     )
 
     return agent

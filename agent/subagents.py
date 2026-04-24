@@ -10,6 +10,21 @@ The otel_subagent also checks the OTel collector emptyDir buffer — this is
 the WRONG HYPOTHESIS the agent will pursue first before correcting itself.
 """
 
+from tools.cloudwatch_tools import (
+    cloudwatch_get_metric,
+    cloudwatch_get_metric_data,
+    cloudwatch_logs_insights,
+    cloudwatch_describe_alarms,
+    cloudwatch_get_traces,
+)
+from tools.kubectl_tools import (
+    kubectl_get,
+    kubectl_describe,
+    kubectl_logs,
+    kubectl_top,
+    kubectl_get_events,
+)
+
 cloudwatch_subagent = {
     "name": "cloudwatch-investigator",
     "description": (
@@ -29,10 +44,10 @@ cloudwatch_subagent = {
         "Report: top 5 disk consumers with write rates and total usage."
     ),
     "tools": [
-        "cloudwatch_get_metric",
-        "cloudwatch_logs_insights",
-        "cloudwatch_describe_alarms",
-        "cloudwatch_get_metric_data",
+        cloudwatch_get_metric,
+        cloudwatch_logs_insights,
+        cloudwatch_describe_alarms,
+        cloudwatch_get_metric_data,
     ],
     "skills": [],
 }
@@ -55,11 +70,11 @@ kubectl_subagent = {
         "priority classes, and any relevant events."
     ),
     "tools": [
-        "kubectl_get",
-        "kubectl_describe",
-        "kubectl_logs",
-        "kubectl_top",
-        "kubectl_get_events",
+        kubectl_get,
+        kubectl_describe,
+        kubectl_logs,
+        kubectl_top,
+        kubectl_get_events,
     ],
     "skills": [
         "./skills/node-disk-pressure/",
@@ -87,9 +102,11 @@ otel_subagent = {
         "otel-collector buffer fill %."
     ),
     "tools": [
-        "cloudwatch_get_metric",
-        "cloudwatch_logs_insights",
-        "cloudwatch_get_traces",
+        cloudwatch_get_metric,
+        cloudwatch_logs_insights,
+        cloudwatch_get_traces,
+        kubectl_describe,
+        kubectl_logs,
     ],
     "skills": [
         "./skills/checkout-protection/",

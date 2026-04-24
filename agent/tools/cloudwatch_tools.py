@@ -160,6 +160,52 @@ def cloudwatch_describe_alarms(alarm_name_prefix: str = "EKS") -> str:
 
 
 @tool
+def cloudwatch_get_traces(
+    service_name: str = "checkoutservice",
+    minutes_back: int = 15,
+) -> str:
+    """
+    Get X-Ray trace statistics for a service (latency, error rate).
+    Use this to check application-level health from distributed traces.
+
+    Args:
+        service_name: Service name to filter (e.g. checkoutservice, paymentservice)
+        minutes_back: Time window in minutes (default 15)
+    """
+    import boto3
+    from datetime import datetime, timedelta, timezone as tz
+
+    client = boto3.client("xray", region_name=os.environ.get("AWS_REGION", "ap-southeast-2"))
+    end = datetime.now(tz.utc)
+    start = end - timedelta(minutes=minutes_back)
+
+    try:
+        response = client.get_service_graph(StartTime=start, EndTime=end)
+        services = response.get("Services", [])
+
+        lines = []
+        for svc in services:
+            name = svc.get("Name", "")
+            if service_name.lower() not in name.lower():
+                continue
+            stats = svc.get("SummaryStatistics", {})
+            total = stats.get("TotalCount", 0)
+            errors = stats.get("ErrorStatistics", {}).get("TotalCount", 0)
+            faults = stats.get("FaultStatistics", {}).get("TotalCount", 0)
+            resp_time = stats.get("TotalResponseTime", 0)
+            avg_ms = (resp_time / total * 1000) if total > 0 else 0
+            lines.append(
+                f"  {name}: {total} requests | avg={avg_ms:.0f}ms | errors={errors} | faults={faults}"
+            )
+
+        if not lines:
+            return f"No X-Ray trace data found for '{service_name}' in last {minutes_back} minutes"
+        return f"X-Ray traces ({service_name}, last {minutes_back}m):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"X-Ray query failed: {e}"
+
+
+@tool
 def cloudwatch_get_metric_data(
     metric_queries: str,
     minutes_back: int = 15,
