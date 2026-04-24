@@ -6,7 +6,7 @@ set -euo pipefail
 
 NAMESPACE="otel-demo"
 RELEASE_NAME="otel-demo"
-CHART_VERSION="0.32.0"   # Pin to tested version
+CHART_VERSION="0.40.7"   # Pin to tested version
 
 echo "==> Adding OpenTelemetry Helm repo..."
 helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts

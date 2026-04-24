@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(kubectl *)",
+      "Bash(AWS_PROFILE=* kubectl *)",
+      "Bash(aws eks *)",
+      "Bash(AWS_PROFILE=* aws eks *)",
+      "Bash(aws sts *)",
+      "Bash(AWS_PROFILE=* aws sts *)",
+      "Bash(aws cloudformation *)",
+      "Bash(AWS_PROFILE=* aws cloudformation *)",
+      "Bash(aws ec2 describe*)",
+      "Bash(AWS_PROFILE=* aws ec2 describe*)",
+      "Bash(aws cloudwatch *)",
+      "Bash(AWS_PROFILE=* aws cloudwatch *)",
+      "Bash(aws iam *)",
+      "Bash(AWS_PROFILE=* aws iam *)",
+      "Bash(eksctl version)",
+      "Bash(helm show *)",
+      "Bash(helm search *)",
+      "Bash(helm list *)",
+      "Bash(docker images *)",
+      "Bash(docker inspect *)"
+    ]
+  }
+}

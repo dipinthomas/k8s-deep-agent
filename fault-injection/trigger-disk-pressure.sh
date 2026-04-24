@@ -20,22 +20,22 @@ echo ""
 
 # Step 1: Crank up load generator to max traffic
 echo "==> Step 1: Scaling load generator to 500 users..."
-kubectl set env deployment/loadgenerator \
+kubectl set env deployment/load-generator \
   -n "$NAMESPACE" \
   LOCUST_USERS=500 \
   LOCUST_SPAWN_RATE=50
 echo "    ✓ Load generator scaled up"
 
-# Step 2: Enable verbose nginx logging on imageprovider (the "misconfiguration")
-echo "==> Step 2: Enabling verbose nginx logging on imageprovider..."
-kubectl set env deployment/imageprovider \
+# Step 2: Enable verbose nginx logging on image-provider (the "misconfiguration")
+echo "==> Step 2: Enabling verbose nginx logging on image-provider..."
+kubectl set env deployment/image-provider \
   -n "$NAMESPACE" \
   NGINX_LOG_LEVEL=debug
 echo "    ✓ nginx logging set to debug"
 
-# Step 3: Remove ephemeral-storage limit on imageprovider
-echo "==> Step 3: Removing ephemeral-storage limit on imageprovider..."
-kubectl patch deployment imageprovider -n "$NAMESPACE" \
+# Step 3: Remove ephemeral-storage limit on image-provider
+echo "==> Step 3: Removing ephemeral-storage limit on image-provider..."
+kubectl patch deployment image-provider -n "$NAMESPACE" \
   --type=json \
   -p='[{"op":"remove","path":"/spec/template/spec/containers/0/resources/limits/ephemeral-storage"}]' \
   2>/dev/null || true   # ignore if limit was already absent

@@ -10,26 +10,26 @@ echo "🟢 Resetting cluster to healthy state..."
 echo ""
 
 echo "==> Scaling down load generator..."
-kubectl set env deployment/loadgenerator \
+kubectl set env deployment/load-generator \
   -n "$NAMESPACE" \
   LOCUST_USERS=10 \
   LOCUST_SPAWN_RATE=1
 echo "    ✓ Load generator returned to 10 users"
 
-echo "==> Restoring imageprovider nginx log level..."
-kubectl set env deployment/imageprovider \
+echo "==> Restoring image-provider nginx log level..."
+kubectl set env deployment/image-provider \
   -n "$NAMESPACE" \
   NGINX_LOG_LEVEL=warn
 echo "    ✓ nginx log level set to warn"
 
-echo "==> Restoring ephemeral-storage limit on imageprovider..."
-kubectl patch deployment imageprovider -n "$NAMESPACE" \
+echo "==> Restoring ephemeral-storage limit on image-provider..."
+kubectl patch deployment image-provider -n "$NAMESPACE" \
   --type=json \
   -p='[{"op":"add","path":"/spec/template/spec/containers/0/resources/limits/ephemeral-storage","value":"500Mi"}]'
 echo "    ✓ ephemeral-storage limit restored to 500Mi"
 
 echo "==> Restarting evicted deployments (if any)..."
-for deployment in imageprovider adservice recommendationservice loadgenerator; do
+for deployment in image-provider ad recommendation load-generator; do
   if kubectl get deployment "$deployment" -n "$NAMESPACE" &>/dev/null; then
     kubectl rollout restart deployment/"$deployment" -n "$NAMESPACE"
     echo "    ✓ Restarted $deployment"
@@ -38,8 +38,8 @@ done
 
 echo ""
 echo "==> Waiting for pods to be ready..."
-kubectl rollout status deployment/imageprovider -n "$NAMESPACE" --timeout=120s
-kubectl rollout status deployment/loadgenerator -n "$NAMESPACE" --timeout=120s
+kubectl rollout status deployment/image-provider -n "$NAMESPACE" --timeout=120s
+kubectl rollout status deployment/load-generator -n "$NAMESPACE" --timeout=120s
 
 echo ""
 echo "==> Current pod status:"
