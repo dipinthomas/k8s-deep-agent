@@ -24,7 +24,40 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO)
+
+# Structured DEBUG logging: each line is prefixed with a monotonic sequence number
+# so log lines can be sorted/grepped by order even when timestamps collide.
+# Use LOG_LEVEL=INFO to suppress debug output in production.
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "DEBUG").upper()
+_seq_lock = threading.Lock()
+_seq = 0
+
+
+def _next_seq() -> str:
+    global _seq
+    with _seq_lock:
+        _seq += 1
+        return f"{_seq:06d}"
+
+
+class _SeqFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        record.seq = _next_seq()
+        return super().format(record)
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(
+    _SeqFormatter(
+        fmt="[%(seq)s] %(levelname)s %(name)s — %(message)s",
+        datefmt=None,
+    )
+)
+logging.basicConfig(level=_LOG_LEVEL, handlers=[_handler], force=True)
+# Silence noisy libraries at WARNING unless we're explicitly debugging them.
+for _noisy in ("httpx", "httpcore", "urllib3", "botocore", "boto3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
 
 from agent import build_agent

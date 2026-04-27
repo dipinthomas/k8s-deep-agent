@@ -52,7 +52,7 @@ The audience sees a complete incident lifecycle:
 ### 2c. The AI Agent
 - **Framework:** Deep Agents (LangChain) — `pip install deepagents`
 - **Runtime:** LangGraph (durable execution, stateful pause/resume)
-- **Model:** Claude claude-sonnet-4-6 (Anthropic) — or configurable
+- **Model:** OpenAI gpt-4.1-mini — set via `AGENT_MODEL=openai:gpt-4.1-mini`
 - **Tools:** kubectl MCP server, CloudWatch MCP server, Slack MCP server
 - **Pattern:** Master agent + specialist subagents (parallel investigation)
 - **Human-in-loop:** LangGraph interrupt() — stateful pause in Slack
@@ -329,7 +329,7 @@ checkpointer = MemorySaver()  # Enables stateful pause/resume
 store = InMemoryStore()        # Long-term memory across incidents
 
 agent = create_deep_agent(
-    model="anthropic:claude-sonnet-4-6",
+    model="openai:gpt-4.1-mini",
     skills=["./skills/"],
     subagents=[cloudwatch_subagent, kubectl_subagent, otel_subagent],
     tools=[post_to_slack, wait_for_approval],
@@ -642,8 +642,8 @@ The fault injection scripts mean they can reproduce the exact demo scenario.
 AWS_REGION=ap-southeast-2
 AWS_PROFILE=fernhub          # ALWAYS use this profile for this project
 
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-...
+# OpenAI (model: gpt-4.1-mini)
+OPENAI_API_KEY=sk-...
 
 # Slack
 SLACK_BOT_TOKEN=xoxb-...

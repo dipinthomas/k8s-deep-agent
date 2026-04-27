@@ -34,6 +34,13 @@ At the start of every investigation:
 - After human approval and execution, mark all steps complete and write the outcome
   to long-term memory.
 
+Namespace discovery — mandatory before any kubectl query:
+- NEVER assume or hardcode a namespace. Cluster names and namespace names are different things.
+- Start every investigation by running: kubectl get namespaces
+- Then find the relevant pods using --all-namespaces filtered by service name.
+- Only use a specific namespace once you have confirmed it exists and contains the pods
+  you are looking for.
+
 Non-negotiable rules:
 - ALWAYS ask for human approval before any action that modifies cluster state.
 - ALWAYS post evidence to Slack before asking for approval.
@@ -53,6 +60,11 @@ _DESTRUCTIVE_DESC_KEYWORDS = {
     "evict", "drain", "apply", "patch", "restart", "scale", "rollout",
 }
 
+# Tools that match the keywords above but are read-only — must never be gated.
+# "reconnect" fires in tool names when the MCP client reconnects its session;
+# "describe_log_groups" matches "creat" in its description but only lists log groups.
+_INTERRUPT_EXCLUSIONS = {"kubectl_reconnect", "describe_log_groups"}
+
 
 def _build_interrupt_on(mcp_tools: list) -> dict:
     """
@@ -64,6 +76,9 @@ def _build_interrupt_on(mcp_tools: list) -> dict:
     """
     interrupt_on = {}
     for tool in mcp_tools:
+        if tool.name in _INTERRUPT_EXCLUSIONS:
+            continue
+
         name_tokens = set(tool.name.lower().split("_"))
         desc_lower = (tool.description or "").lower()
 
