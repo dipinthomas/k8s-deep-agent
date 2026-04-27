@@ -99,13 +99,20 @@ def agent_config(thread_ts: str, channel: str) -> dict:
     }
 
 
-def stream_agent(messages: list, thread_ts: str, channel: str) -> None:
+def stream_agent(messages, thread_ts: str, channel: str) -> None:
     """Run the agent and stream chunks. Uses astream() via asyncio.run() because
-    MCP tools are async-only and cannot be invoked synchronously."""
+    MCP tools are async-only and cannot be invoked synchronously.
+
+    Pass messages=None to resume a graph paused at an interrupt_on gate without
+    injecting a new user message — this lets the queued tool call execute directly.
+    Pass a list of message dicts to start a new turn or continue after a denial.
+    """
     config = agent_config(thread_ts, channel)
+    # None resumes the interrupted graph; a message list starts/continues a turn.
+    input_payload = None if messages is None else {"messages": messages}
 
     async def _run():
-        async for chunk in agent.astream({"messages": messages}, config):
+        async for chunk in agent.astream(input_payload, config):
             logger.debug("Agent chunk: %s", chunk)
 
     asyncio.run(_run())
@@ -296,13 +303,12 @@ def handle_approve(ack, body, say):
     logger.info("Action approved by %s", user)
     say(text=f"✅ Approved by @{user}. Proceeding...", thread_ts=thread_ts, channel=channel)
 
+    # Resume the paused LangGraph graph with None — this clears the interrupt_on gate
+    # and lets the already-queued tool call execute without re-invoking the model.
+    # Passing a user message here causes the model to re-plan and re-trigger the interrupt.
     threading.Thread(
         target=stream_agent,
-        args=(
-            [{"role": "user", "content": "APPROVED — proceed with the recommended actions."}],
-            thread_ts,
-            channel,
-        ),
+        args=(None, thread_ts, channel),
         daemon=True,
     ).start()
 
