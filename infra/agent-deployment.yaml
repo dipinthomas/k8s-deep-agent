@@ -58,8 +58,8 @@ metadata:
   name: k8s-agent-cluster-role
 rules:
 - apiGroups: [""]
-  resources: ["nodes", "namespaces", "pods", "pods/log", "events", "services", "configmaps"]
-  verbs: ["get", "list", "watch", "delete"]
+  resources: ["nodes", "namespaces", "pods", "pods/log", "pods/exec", "events", "services", "configmaps"]
+  verbs: ["get", "list", "watch", "delete", "create"]
 - apiGroups: ["apps"]
   resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
   verbs: ["get", "list", "watch", "patch", "update"]
@@ -248,8 +248,8 @@ metadata:
   namespace: otel-demo
 rules:
 - apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list", "watch", "delete"]
+  resources: ["pods", "pods/log", "pods/exec"]
+  verbs: ["get", "list", "watch", "delete", "create"]
 - apiGroups: [""]
   resources: ["events"]
   verbs: ["get", "list", "watch"]
