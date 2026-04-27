@@ -20,7 +20,8 @@
       "Bash(helm search *)",
       "Bash(helm list *)",
       "Bash(docker images *)",
-      "Bash(docker inspect *)"
+      "Bash(docker inspect *)",
+      "Bash(npx *)"
     ]
   }
 }

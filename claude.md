@@ -27,8 +27,8 @@ The audience sees a complete incident lifecycle:
 
 ## 2. WHAT WE ARE BUILDING
 
-### 2a. The Sample Application
-**OpenTelemetry Astronomy Shop** — a 16-service e-commerce microservices app
+### 2a. T
+**OpenTelemetry Astronomy Shop** — a 16-service e-commehe Sample Applicationrce microservices app
 - GitHub: https://github.com/open-telemetry/opentelemetry-demo
 - Deployed via Helm on EKS
 - Services we care about most:
@@ -640,7 +640,7 @@ The fault injection scripts mean they can reproduce the exact demo scenario.
 ```bash
 # AWS
 AWS_REGION=ap-southeast-2
-AWS_PROFILE=default  # or use IAM role on EKS
+AWS_PROFILE=fernhub          # ALWAYS use this profile for this project
 
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-...

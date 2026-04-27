@@ -48,31 +48,37 @@ def post_to_slack(message: str, thread_ts: str = "") -> str:
         return f"Slack error: {e.response['error']}"
 
 
+# Called by the agent BEFORE attempting a destructive tool call.
+# Posts evidence and APPROVE/DENY buttons to Slack.
+# The agent continues after this call — the actual pause happens when
+# interrupt_on fires on the subsequent destructive tool call.
+# See agent.py for the full human-in-the-loop sequence.
 @tool
 def post_approval_request(
     summary: str,
     evidence: str,
-    eviction_list: str,
+    action_list: str,
     impact: str,
     thread_ts: str = "",
 ) -> str:
     """
     Post a structured approval request to Slack with interactive buttons.
-    Use this when you are ready to recommend evictions and need human approval.
+    Use this when you have gathered evidence and need human approval before
+    taking any action that modifies cluster state.
 
     Args:
-        summary:      1-2 sentence root cause summary
-        evidence:     Key CloudWatch metrics and findings (mrkdwn)
-        eviction_list: Ranked list of pods to evict (lowest priority first)
-        impact:       What will be affected by the evictions
-        thread_ts:    Thread to post in (optional)
+        summary:     1-2 sentence root cause summary
+        evidence:    Key metrics and findings (mrkdwn)
+        action_list: Ranked list of actions to take (lowest risk first)
+        impact:      What will be affected by the actions
+        thread_ts:   Thread to post in (optional)
     """
     blocks = [
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": "⚠️  Approval Required — Pod Eviction",
+                "text": "⚠️  Approval Required",
                 "emoji": True,
             },
         },
@@ -88,19 +94,12 @@ def post_approval_request(
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*Recommended evictions (lowest priority first):*\n{eviction_list}",
+                "text": f"*Recommended actions:*\n{action_list}",
             },
         },
         {
             "type": "section",
             "text": {"type": "mrkdwn", "text": f"*Impact:*\n{impact}"},
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "✅ *checkoutservice, paymentservice, cartservice are NOT on this list.*",
-            },
         },
         {"type": "divider"},
         {
@@ -110,24 +109,24 @@ def post_approval_request(
                     "type": "button",
                     "text": {"type": "plain_text", "text": "✅ APPROVE", "emoji": True},
                     "style": "primary",
-                    "action_id": "approve_eviction",
+                    "action_id": "agent_approve",
                     "value": "approve",
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "🚫 DENY", "emoji": True},
                     "style": "danger",
-                    "action_id": "deny_eviction",
+                    "action_id": "agent_deny",
                     "value": "deny",
                 },
                 {
                     "type": "button",
                     "text": {
                         "type": "plain_text",
-                        "text": "🔍 GIVE ME MORE DETAILS",
+                        "text": "🔍 MORE DETAILS",
                         "emoji": True,
                     },
-                    "action_id": "more_details",
+                    "action_id": "agent_more_details",
                     "value": "details",
                 },
             ],

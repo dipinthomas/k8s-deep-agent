@@ -1,0 +1,40 @@
+# MCP server definitions — HTTP/SSE transport via k8s-mcp-gateway pod
+#
+# Both MCP servers run in the k8s-mcp-gateway pod and are exposed via a
+# ClusterIP Service. The agent connects to them over HTTP/SSE — no stdio
+# subprocesses run inside the agent container.
+#
+# Auth:
+#   kubectl-mcp    — in-cluster ServiceAccount token (K8s RBAC in mcp-gateway-deployment.yaml)
+#   cloudwatch-mcp — IRSA (EKS injects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE
+#                    into the gateway pod; the AWS SDK picks them up automatically)
+#   slack-mcp      — replaced by tools/slack_tools.py (custom Block Kit UI)
+#
+# Local dev: set KUBECTL_MCP_URL and CLOUDWATCH_MCP_URL env vars to point at
+# locally-running MCP servers:
+#   Terminal 1: npx mcp-server-kubernetes --transport http --port 3001
+#   Terminal 2: uvx awslabs.cloudwatch-mcp-server@latest --transport sse --port 3002
+#   Terminal 3: KUBECTL_MCP_URL=http://localhost:3001/sse \
+#               CLOUDWATCH_MCP_URL=http://localhost:3002/sse \
+#               python agent/main.py
+
+servers:
+  kubectl-mcp:
+    transport: sse
+    url: "http://k8s-mcp-gateway.otel-demo.svc.cluster.local:3001/sse"
+    env_override: KUBECTL_MCP_URL
+    description: >
+      Kubernetes cluster operations. Uses in-cluster ServiceAccount token
+      when running in the gateway pod; falls back to KUBECONFIG for local dev.
+      K8s RBAC defined in infra/mcp-gateway-deployment.yaml.
+
+  cloudwatch-mcp:
+    transport: sse
+    url: "http://k8s-mcp-gateway.otel-demo.svc.cluster.local:3002/sse"
+    env_override: CLOUDWATCH_MCP_URL
+    description: >
+      AWS CloudWatch metrics, Logs Insights queries, and alarms.
+      IAM permissions via IRSA — same k8s-agent-irsa role as the agent pod.
+
+  # slack-mcp is intentionally omitted — tools/slack_tools.py handles Slack
+  # because post_approval_request requires custom Block Kit buttons (APPROVE / DENY).

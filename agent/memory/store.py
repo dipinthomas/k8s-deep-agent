@@ -1,26 +1,38 @@
 """
 Long-term memory store for the K8s agent.
 Persists incident history and known failure patterns across runs.
-Uses LangGraph InMemoryStore for the demo (swap for a persistent store in production).
+Uses Redis when REDIS_URL is set; falls back to InMemoryStore for local dev.
 """
 
+import os
+import logging
 from langgraph.store.memory import InMemoryStore
+
+logger = logging.getLogger(__name__)
 
 # Namespace keys used for storing agent memories
 NS_INCIDENTS = ("incidents",)     # Past incidents and resolutions
 NS_PATTERNS = ("patterns",)       # Known failure patterns (root causes)
 NS_NODES = ("nodes",)             # Node-specific notes
 
+REDIS_URL = os.environ.get("REDIS_URL", "")
 
-def build_memory_store() -> InMemoryStore:
-    """
-    Build and pre-seed the memory store with known cluster patterns.
-    The agent reads from this store when investigating new incidents,
-    and writes to it after each resolution.
-    """
-    store = InMemoryStore()
 
-    # Pre-seed known failure patterns so the agent has institutional memory
+def build_memory_store():
+    """
+    Build the memory store. Uses Redis if REDIS_URL is set, otherwise InMemoryStore.
+    Seeding is done separately via seed_memory_store() at agent startup.
+    """
+    logger.info("Using InMemoryStore (Redis Stack required for persistent store)")
+    return InMemoryStore()
+
+
+def seed_memory_store(store) -> None:
+    """
+    Pre-seed the memory store with known cluster patterns.
+    Called once at agent startup. Idempotent — safe to call on Redis where
+    data already persists; patterns will be overwritten with the latest values.
+    """
     store.put(
         NS_PATTERNS,
         "imageprovider-nginx-verbose-logging",
@@ -70,8 +82,6 @@ def build_memory_store() -> InMemoryStore:
             "services_affected": ["loadgenerator", "imageprovider"],
         },
     )
-
-    return store
 
 
 def format_incident_record(

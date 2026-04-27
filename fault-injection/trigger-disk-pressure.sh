@@ -1,25 +1,21 @@
 #!/bin/bash
 # Trigger the disk pressure demo scenario on the EKS cluster.
-# Run this 3-5 minutes before the demo.
+# Run this 3-5 minutes before the demo moment in the talk.
 #
-# What this does:
-#   1. Cranks up load generator to 500 users (amplifies nginx log writes)
-#   2. Sets image-provider nginx to debug logging (the "root cause misconfiguration")
-#   3. Removes image-provider ephemeral-storage limits
-#   4. Fills ~60GB of disk directly inside the image-provider pod using dd
-#      (needed because EKS Auto Mode nodes have ~100GB disks — nginx logs alone
-#       take too long to fill them for a live demo)
+# How it works:
+#   1. Cranks load generator to 500 users
+#   2. Sets image-provider nginx to debug logging (the root cause)
+#   3. Deploys a privileged fill pod on the same node as image-provider,
+#      which writes exactly enough bytes to reach TARGET_PCT (default 78%)
+#      on the NODE's actual filesystem — bypassing container ephemeral limits.
 #
-# The dd fill targets the image-provider pod's emptyDir so evicting that pod
-# releases the disk space — matching the demo story exactly.
-#
-# Monitor progress:
-#   kubectl describe node | grep -A5 Conditions
-#   watch -n5 kubectl top pods -n otel-demo
+# The fill pod stays running to hold the allocation.
+# Run reset-cluster.sh to clean up after the demo.
 
 set -euo pipefail
 
 NAMESPACE="otel-demo"
+TARGET_PCT="${TARGET_PCT:-78}"   # fill node disk to this percentage
 REGION="ap-southeast-2"
 
 echo "🔴 Triggering disk pressure demo scenario..."
@@ -33,73 +29,119 @@ kubectl set env deployment/load-generator \
   LOCUST_SPAWN_RATE=50
 echo "    ✓ Load generator scaled up"
 
-# ── Step 2: Enable verbose nginx logging (the storytelling root cause) ─────────
+# ── Step 2: Enable verbose nginx logging ──────────────────────────────────────
 echo "==> Step 2: Enabling verbose nginx logging on image-provider..."
 kubectl set env deployment/image-provider \
   -n "$NAMESPACE" \
   NGINX_LOG_LEVEL=debug
 echo "    ✓ nginx logging set to debug"
 
-# ── Step 3: Remove ephemeral-storage limit ────────────────────────────────────
-echo "==> Step 3: Removing ephemeral-storage limit on image-provider..."
-kubectl patch deployment image-provider -n "$NAMESPACE" \
-  --type=json \
-  -p='[{"op":"remove","path":"/spec/template/spec/containers/0/resources/limits/ephemeral-storage"}]' \
-  2>/dev/null || true
-echo "    ✓ ephemeral-storage limit removed"
-
-# ── Step 4: Wait for image-provider pod to redeploy ───────────────────────────
+# ── Step 3: Wait for image-provider to redeploy ───────────────────────────────
 echo ""
-echo "==> Step 4: Waiting for image-provider to redeploy with new settings..."
+echo "==> Step 3: Waiting for image-provider to redeploy with new settings..."
 kubectl rollout status deployment/image-provider -n "$NAMESPACE" --timeout=120s
 echo "    ✓ image-provider redeployed"
 
-# ── Step 5: Directly fill disk to push node above threshold ───────────────────
-# EKS Auto Mode nodes have ~100GB disks so nginx debug logs alone are too slow.
-# We dd a 60GB sparse file into /tmp inside the pod, which counts against the
-# node's ephemeral storage.  Evicting the pod drops usage back below threshold.
+# ── Step 4: Find the node image-provider landed on ────────────────────────────
 echo ""
-echo "==> Step 5: Filling disk on image-provider pod (~60 GB — takes ~60s)..."
-
-IMAGE_PROVIDER_POD=$(kubectl get pod -n "$NAMESPACE" \
-  -l app.kubernetes.io/name=image-provider \
-  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
-  kubectl get pod -n "$NAMESPACE" \
+echo "==> Step 4: Finding target node..."
+TARGET_NODE=$(kubectl get pod -n "$NAMESPACE" \
   -l app.kubernetes.io/component=image-provider \
-  -o jsonpath='{.items[0].metadata.name}')
+  -o jsonpath='{.items[0].spec.nodeName}')
+echo "    Target node: $TARGET_NODE"
 
-if [[ -z "$IMAGE_PROVIDER_POD" ]]; then
-  echo "    ✗ Could not find image-provider pod — skipping disk fill"
-  echo "      Run manually: kubectl get pods -n $NAMESPACE | grep image-provider"
-else
-  echo "    Pod: $IMAGE_PROVIDER_POD"
-  # fallocate is faster than dd but may not be available in the nginx image;
-  # fall back to dd with bs=1M.
-  kubectl exec "$IMAGE_PROVIDER_POD" -n "$NAMESPACE" -- \
-    sh -c 'fallocate -l 60G /tmp/demo-disk-fill 2>/dev/null || dd if=/dev/zero of=/tmp/demo-disk-fill bs=1M count=61440 status=none' &
-  FILL_PID=$!
-  echo "    Filling in background (PID $FILL_PID)..."
-  echo "    ✓ Disk fill running — node disk usage will rise in ~60 seconds"
-fi
+# ── Step 5: Deploy privileged fill pod ────────────────────────────────────────
+# Writes directly to the Bottlerocket data partition (/local on the node).
+# On Bottlerocket, /local is the writable 80GB xfs data partition (nvme1n1p1).
+# /local/mnt, /local/opt, /local/var are bind-mounted read-only from the OS root —
+# must write to a NEW directory created directly under /local (e.g. /local/demo-diskfill/).
+echo ""
+echo "==> Step 5: Deploying disk fill pod on $TARGET_NODE..."
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# Remove any previous fill pod
+kubectl delete pod demo-disk-filler -n "$NAMESPACE" --ignore-not-found --wait=false 2>/dev/null || true
+
+# Write pod spec to file then apply (avoids heredoc quoting issues with shell escapes)
+FILL_POD_YAML="/tmp/demo-disk-filler.yaml"
+cat > "$FILL_POD_YAML" <<PODEOF
+apiVersion: v1
+kind: Pod
+metadata:
+  name: demo-disk-filler
+  namespace: ${NAMESPACE}
+  labels:
+    app: demo-disk-filler
+spec:
+  nodeName: ${TARGET_NODE}
+  restartPolicy: Never
+  tolerations:
+    - operator: Exists
+  containers:
+    - name: filler
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          set -e
+          TARGET_PCT=${TARGET_PCT}
+
+          # EKS Auto Mode nodes run Bottlerocket OS.
+          # /dev/nvme1n1p1 is the 80GB data partition mounted at /local (rw xfs).
+          # /local/mnt, /local/opt, /local/var are bind-mounted read-only from the erofs OS root.
+          # Must create a new directory directly under /local to get a writable path.
+          DATA_MOUNT="/host/local"
+          FILL_FILE="\${DATA_MOUNT}/filldata"
+
+
+          TOTAL_KB=\$(df "\$DATA_MOUNT" | awk 'NR==2{print \$2}')
+          USED_KB=\$(df "\$DATA_MOUNT"  | awk 'NR==2{print \$3}')
+          AVAIL_KB=\$(df "\$DATA_MOUNT" | awk 'NR==2{print \$4}')
+
+          CURRENT_PCT=\$(( USED_KB * 100 / TOTAL_KB ))
+          echo "Node data disk (/local): \${CURRENT_PCT}% used (\${USED_KB}KB / \${TOTAL_KB}KB)"
+
+          if [ "\$CURRENT_PCT" -ge "\$TARGET_PCT" ]; then
+            echo "Already at \${CURRENT_PCT}% — no fill needed."
+            tail -f /dev/null
+          fi
+
+          HEADROOM_KB=\$(( 3 * 1024 * 1024 ))
+          FILL_KB=\$(( TOTAL_KB * TARGET_PCT / 100 - USED_KB ))
+          MAX_FILL_KB=\$(( AVAIL_KB - HEADROOM_KB ))
+          [ "\$FILL_KB" -gt "\$MAX_FILL_KB" ] && FILL_KB=\$MAX_FILL_KB
+          FILL_MB=\$(( FILL_KB / 1024 ))
+
+          echo "Writing \${FILL_MB}MB to \${FILL_FILE} to reach \${TARGET_PCT}%..."
+          dd if=/dev/zero of="\${FILL_FILE}" bs=1M count=\$FILL_MB
+          echo "Fill complete."
+          df "\$DATA_MOUNT" | awk 'NR==2{printf "Final: %d%% used (%sKB / %sKB)\n", \$3*100/\$2, \$3, \$2}'
+
+          tail -f /dev/null
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: host
+          mountPath: /host
+  volumes:
+    - name: host
+      hostPath:
+        path: /
+PODEOF
+
+kubectl apply -f "$FILL_POD_YAML"
+
+echo "    ✓ Fill pod deployed — writing to node filesystem..."
 echo ""
-echo "⏳ CloudWatch alarm should fire in 2-4 minutes (2 × 1-min evaluation periods)."
+echo "⏳ Disk will fill in ~30-60s. CloudWatch alarm fires after 2 evaluation periods (~2 min)."
 echo ""
-echo "Monitor disk fill:"
-echo "  kubectl exec -n $NAMESPACE $IMAGE_PROVIDER_POD -- df -h /tmp"
+echo "Monitor fill progress:"
+echo "  kubectl logs -n $NAMESPACE demo-disk-filler -f"
+echo ""
+echo "Monitor node disk %:"
+echo "  kubectl exec -n $NAMESPACE demo-disk-filler -- df -h /host"
 echo ""
 echo "Monitor node conditions:"
-echo "  kubectl describe node | grep -A10 Conditions"
-echo "  watch -n5 'kubectl top pods -n $NAMESPACE'"
+echo "  kubectl describe node $TARGET_NODE | grep -A6 Conditions"
 echo ""
-echo "Check CloudWatch metric (requires Container Insights to have scraped at least one point):"
-echo "  aws cloudwatch get-metric-statistics \\"
-echo "    --namespace ContainerInsights \\"
-echo "    --metric-name node_filesystem_utilization \\"
-echo "    --dimensions Name=ClusterName,Value=otel-demo-prod \\"
-echo "    --start-time \$(date -u -v-15M +%Y-%m-%dT%H:%M:%SZ) \\"
-echo "    --end-time \$(date -u +%Y-%m-%dT%H:%M:%SZ) \\"
-echo "    --period 60 --statistics Average --region $REGION"
-echo ""
-echo "When the CloudWatch alarm fires it will post to #k8s-alerts and wake the agent."
+echo "When the alarm fires it posts to #k8s-alerts and wakes the agent."

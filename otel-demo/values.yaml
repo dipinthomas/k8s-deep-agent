@@ -1,6 +1,7 @@
 # Helm values for OpenTelemetry Demo v0.40.7
 # Customised for the NZ Tech Rally disk pressure demo scenario
 
+# ── Application components ─────────────────────────────────────────────────────
 components:
   # image-provider: verbose nginx logging pre-enabled for fault injection demo
   image-provider:
@@ -44,7 +45,6 @@ components:
       - name: PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION
         value: python
 
-  # Keep all critical services enabled with sensible resource limits
   checkout:
     enabled: true
     useDefault:
@@ -110,3 +110,10 @@ components:
         memory: 128Mi
       limits:
         memory: 256Mi
+
+  # flagd not needed for demo
+  flagd:
+    enabled: false
+  # postgresql IS needed — product-catalog uses it as backing store
+  postgresql:
+    enabled: true

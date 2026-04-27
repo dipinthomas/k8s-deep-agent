@@ -24,7 +24,7 @@ helm upgrade --install "$RELEASE_NAME" open-telemetry/opentelemetry-demo \
   --version "$CHART_VERSION" \
   --values "$(dirname "$0")/values.yaml" \
   --wait \
-  --timeout 10m
+  --timeout 20m
 
 echo ""
 echo "==> Deployment complete. Verifying pods..."

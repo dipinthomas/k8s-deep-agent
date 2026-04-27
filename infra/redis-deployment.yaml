@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-redis
+  namespace: k8s-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-redis
+  template:
+    metadata:
+      labels:
+        app: agent-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        # Persist to emptyDir so data survives container restarts within the pod
+        # (not pod deletion — acceptable for demo)
+        args: ["--appendonly", "yes", "--appendfsync", "everysec"]
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-redis
+  namespace: k8s-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-redis
+  ports:
+  - port: 6379
+    targetPort: 6379

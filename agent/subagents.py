@@ -1,114 +1,125 @@
 """
 Subagent definitions for parallel incident investigation.
 
-Three subagents spawn simultaneously when an incident is detected:
-  - cloudwatch_subagent: disk metrics and container insights
-  - kubectl_subagent:    cluster state (nodes, pods, conditions)
-  - otel_subagent:       app-level traces and latency (checkout/payment health)
-
-The otel_subagent also checks the OTel collector emptyDir buffer — this is
-the WRONG HYPOTHESIS the agent will pursue first before correcting itself.
+Each subagent owns a domain (CloudWatch metrics, K8s cluster state, OTel traces).
+They receive the full MCP tool list and use their role + skills to decide what to
+query — no hardcoded investigation steps. Scenario-specific playbooks live in skills/.
 """
 
-from tools.cloudwatch_tools import (
-    cloudwatch_get_metric,
-    cloudwatch_get_metric_data,
-    cloudwatch_logs_insights,
-    cloudwatch_describe_alarms,
-    cloudwatch_get_traces,
+from typing import Any
+
+_RETURN_CONTRACT = (
+    "Return your findings as a structured markdown report using exactly these sections:\n"
+    "## Summary\n"
+    "One sentence: what you found or confirmed.\n"
+    "## Evidence\n"
+    "Bullet list of data points with metric names, values, units, and timestamps.\n"
+    "## Conclusion\n"
+    "Your assessment: what this data means for the incident. "
+    "Explicitly state if something is within normal range — absence of a problem is evidence too.\n"
+    "## Gaps\n"
+    "Any queries that failed, returned no data, or could not be completed. "
+    "State what is unknown so the master agent can decide whether to follow up.\n\n"
+    "Do not return raw tool output. Summarise and structure it."
 )
-from tools.kubectl_tools import (
-    kubectl_get,
-    kubectl_describe,
-    kubectl_logs,
-    kubectl_top,
-    kubectl_get_events,
-)
 
-cloudwatch_subagent = {
-    "name": "cloudwatch-investigator",
-    "description": (
-        "Investigates CloudWatch metrics, logs, and alarms. "
-        "Use for disk usage metrics, container insights, "
-        "application latency data, and CloudWatch Logs Insights queries."
-    ),
-    "system_prompt": (
-        "You are a CloudWatch specialist. Query metrics and logs efficiently. "
-        "Always include timestamps and units in findings. "
-        "Return structured data the master agent can act on.\n\n"
-        "For disk pressure incidents, query these in order:\n"
-        "1. node_filesystem_utilization for all nodes in the cluster\n"
-        "2. container_fs_usage_bytes grouped by pod_name\n"
-        "3. CloudWatch Logs Insights on /aws/containerinsights/otel-demo-prod/performance "
-        "   for disk write rates per pod in the last 15 minutes\n"
-        "Report: top 5 disk consumers with write rates and total usage."
-    ),
-    "tools": [
-        cloudwatch_get_metric,
-        cloudwatch_logs_insights,
-        cloudwatch_describe_alarms,
-        cloudwatch_get_metric_data,
-    ],
-    "skills": [],
-}
 
-kubectl_subagent = {
-    "name": "kubectl-investigator",
-    "description": (
-        "Investigates Kubernetes cluster state. Use for node conditions, "
-        "pod status, resource usage, events, and priority classes."
-    ),
-    "system_prompt": (
-        "You are a Kubernetes specialist. READ ONLY — never modify anything.\n\n"
-        "For disk pressure incidents, check in this order:\n"
-        "1. kubectl describe nodes — look for DiskPressure=True condition\n"
-        "2. kubectl get pods -n otel-demo -o wide — identify which pods are on the affected node\n"
-        "3. kubectl describe pod -n otel-demo <pod> for top disk consumers\n"
-        "4. kubectl get events -n otel-demo --sort-by=.lastTimestamp\n"
-        "5. kubectl top pods -n otel-demo — current CPU/memory\n\n"
-        "Return: node name, DiskPressure status, list of pods on node with their "
-        "priority classes, and any relevant events."
-    ),
-    "tools": [
-        kubectl_get,
-        kubectl_describe,
-        kubectl_logs,
-        kubectl_top,
-        kubectl_get_events,
-    ],
-    "skills": [
-        "./skills/node-disk-pressure/",
-        "./skills/pod-priority-eviction/",
-    ],
-}
+def build_subagents(mcp_tools: list[Any]) -> list[dict]:
+    """
+    Build the three subagent definitions, injecting the MCP tools loaded
+    at startup. Called once from agent.py during agent construction.
+    """
 
-otel_subagent = {
-    "name": "otel-investigator",
-    "description": (
-        "Investigates application performance using OTel traces and metrics "
-        "from CloudWatch. Use for service latency, error rates, and trace analysis. "
-        "Also checks OTel collector emptyDir buffer usage."
-    ),
-    "system_prompt": (
-        "You are an observability specialist. Focus on service health and user-facing impact.\n\n"
-        "For disk pressure incidents, check:\n"
-        "1. CloudWatch metric: checkout service p99 latency (last 15 min)\n"
-        "2. CloudWatch metric: payment service error rate (last 15 min)\n"
-        "3. OTel collector pod emptyDir volume usage (kubectl describe pod otelcol)\n"
-        "   — check if emptyDir is near capacity (this is a common red herring)\n"
-        "4. CloudWatch Logs Insights: trace data volume written by otel-collector\n\n"
-        "IMPORTANT: Report OTel collector buffer usage explicitly, even if it looks normal.\n"
-        "Report: checkout p99 latency, payment error rate, cart service health, "
-        "otel-collector buffer fill %."
-    ),
-    "tools": [
-        cloudwatch_get_metric,
-        cloudwatch_logs_insights,
-        cloudwatch_get_traces,
-        kubectl_describe,
-        kubectl_logs,
-    ],
-    "skills": [
-        "./skills/checkout-protection/",
-    ],
-}
+    cloudwatch_subagent = {
+        "name": "cloudwatch-investigator",
+        "description": (
+            "Investigates CloudWatch metrics, logs, and alarms. "
+            "Use for disk usage metrics, container insights, "
+            "application latency data, and CloudWatch Logs Insights queries."
+        ),
+        "system_prompt": (
+            "You are a CloudWatch specialist. Your job is to surface metric and log evidence "
+            "that the master agent cannot see from kubectl alone.\n\n"
+            "How to work:\n"
+            "- Start by listing available tools to understand what you can query.\n"
+            "- Go broad first (node-level or cluster-level metrics), then drill into the "
+            "  specific resources that look anomalous.\n"
+            "- If a tool call fails or returns no data, try a different metric name or time window "
+            "  — do not stop investigating.\n"
+            "- Always include timestamps, units, and the time window in every data point you return.\n\n"
+            "Output contract — always return:\n"
+            "- Top disk/CPU/memory consumers (whichever is relevant), with rates not just totals\n"
+            "- The metric names and namespaces you queried (so the master agent can follow up)\n"
+            "- Any CloudWatch alarms currently in ALARM state\n"
+            "- Explicit call-out if any metric is within normal range (absence of evidence matters)\n\n"
+            + _RETURN_CONTRACT
+        ),
+        "tools": mcp_tools,
+        "skills": [],
+    }
+
+    kubectl_subagent = {
+        "name": "kubectl-investigator",
+        "description": (
+            "Investigates Kubernetes cluster state. Use for node conditions, "
+            "pod status, resource usage, events, and priority classes."
+        ),
+        "system_prompt": (
+            "You are a Kubernetes cluster state specialist. READ ONLY — you must never "
+            "modify, patch, delete, or restart anything. Your job is to give the master "
+            "agent a precise picture of what the cluster looks like right now.\n\n"
+            "How to work:\n"
+            "- Start by listing available tools. Do not assume tool names — discover them.\n"
+            "- Start at the node level (conditions, resource pressure, taints), then move to "
+            "  pod level (status, phase, restarts, resource usage, placement).\n"
+            "- Always check recent events — they often explain what kubectl describe does not.\n"
+            "- If a tool returns an error, note it and try an equivalent tool or narrower query.\n\n"
+            "Output contract — always return:\n"
+            "- Node conditions (DiskPressure, MemoryPressure, PIDPressure, Ready) for all nodes\n"
+            "- For any node with a pressure condition: list of pods on that node with their "
+            "  priority class and resource usage\n"
+            "- Recent warning events (last 15 minutes) across the namespace\n"
+            "- Any pods in non-Running phase (Pending, Evicted, OOMKilled, CrashLoopBackOff)\n\n"
+            + _RETURN_CONTRACT
+        ),
+        "tools": mcp_tools,
+        "skills": [
+            "./skills/universal/node-disk-pressure/",
+            "./skills/universal/pod-priority-eviction/",
+        ],
+    }
+
+    otel_subagent = {
+        "name": "otel-investigator",
+        "description": (
+            "Investigates application performance using OTel traces and metrics "
+            "from CloudWatch. Use for service latency, error rates, and trace analysis."
+        ),
+        "system_prompt": (
+            "You are an application observability specialist. Your job is to assess the "
+            "health and performance of services from the application layer — traces, "
+            "metrics, and logs that describe what users are experiencing, not what the "
+            "infrastructure is doing.\n\n"
+            "How to work:\n"
+            "- Start by listing available tools. Query what you can, not what you assume exists.\n"
+            "- Focus on user-facing symptoms first: latency percentiles, error rates, "
+            "  throughput changes. Then look for the cause at the application layer.\n"
+            "- Report both what is degraded AND what is healthy — healthy baselines help "
+            "  the master agent understand blast radius.\n"
+            "- If a metric or trace query returns no data, say so explicitly. Do not infer.\n\n"
+            "Output contract — always return:\n"
+            "- Latency (p50, p99) and error rate for each critical service you can observe\n"
+            "- Whether the observability pipeline itself (OTel collector) is healthy — "
+            "  report its status even if normal, because a silently-failed collector means "
+            "  all other metrics may be stale\n"
+            "- The time window you queried and any gaps in data\n"
+            "- A one-line user impact summary the master agent can quote in Slack\n\n"
+            + _RETURN_CONTRACT
+        ),
+        "tools": mcp_tools,
+        "skills": [
+            "./skills/universal/checkout-protection/",
+        ],
+    }
+
+    return [cloudwatch_subagent, kubectl_subagent, otel_subagent]

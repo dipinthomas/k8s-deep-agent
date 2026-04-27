@@ -1,24 +1,28 @@
 FROM python:3.11-slim
 
-# Install kubectl
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
-    chmod +x kubectl && mv kubectl /usr/local/bin/ && \
-    apt-get purge -y curl && apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
+# ── System deps ────────────────────────────────────────────────────────────────
+# curl + ca-certificates: kubectl download, OIDC token fetch
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
+# ── kubectl (for fallback / troubleshooting) ───────────────────────────────────
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+    && chmod +x kubectl && mv kubectl /usr/local/bin/
+
+# ── Python application deps ────────────────────────────────────────────────────
 WORKDIR /app
 
-# Install Python deps first for better layer caching
 COPY agent/requirements.txt agent/requirements.txt
 RUN pip install --no-cache-dir -r agent/requirements.txt
 
-# Copy repo contents (AGENTS.md, skills/, agent/)
+# ── Application code ───────────────────────────────────────────────────────────
+# Copy AGENTS.md and skills so the agent can read them at runtime
 COPY AGENTS.md .
 COPY skills/ skills/
 COPY agent/ agent/
 
-# agent/ directory must be on PYTHONPATH for intra-package imports
+# agent/ must be on PYTHONPATH for intra-package imports (mcp.mcp_client, etc.)
 ENV PYTHONPATH=/app/agent
 
 CMD ["python", "agent/main.py"]

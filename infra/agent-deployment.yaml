@@ -7,7 +7,11 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: k8s-agent
-  namespace: otel-demo
+  namespace: k8s-agent
+  annotations:
+    # IRSA: grants the agent pod AWS credentials via the k8s-agent-irsa IAM role.
+    # Role is created by infra/setup-agent-irsa.sh — run that before deploying.
+    eks.amazonaws.com/role-arn: arn:aws:iam::637039075925:role/k8s-agent-irsa
 
 ---
 # Namespace-scoped permissions: full pod/log/event access in otel-demo
@@ -15,7 +19,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: k8s-agent-role
-  namespace: otel-demo
+  namespace: k8s-agent
 rules:
 - apiGroups: [""]
   resources: ["pods", "pods/log"]
@@ -35,42 +39,46 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: k8s-agent-binding
-  namespace: otel-demo
+  namespace: k8s-agent
 subjects:
 - kind: ServiceAccount
   name: k8s-agent
-  namespace: otel-demo
+  namespace: k8s-agent
 roleRef:
   kind: Role
   name: k8s-agent-role
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Cluster-scoped: read nodes (needed for disk pressure checks)
+# Cluster-wide: agent needs full read/write access across all namespaces
+# (pods may be in any namespace; model may hallucinate namespace names)
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: k8s-agent-node-reader
+  name: k8s-agent-cluster-role
 rules:
 - apiGroups: [""]
-  resources: ["nodes"]
-  verbs: ["get", "list", "watch"]
+  resources: ["nodes", "namespaces", "pods", "pods/log", "events", "services", "configmaps"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch", "patch", "update"]
 - apiGroups: ["metrics.k8s.io"]
-  resources: ["nodes"]
+  resources: ["nodes", "pods"]
   verbs: ["get", "list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: k8s-agent-node-reader
+  name: k8s-agent-cluster-binding
 subjects:
 - kind: ServiceAccount
   name: k8s-agent
-  namespace: otel-demo
+  namespace: k8s-agent
 roleRef:
   kind: ClusterRole
-  name: k8s-agent-node-reader
+  name: k8s-agent-cluster-role
   apiGroup: rbac.authorization.k8s.io
 
 ---
@@ -78,7 +86,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: k8s-agent
-  namespace: otel-demo
+  namespace: k8s-agent
   labels:
     app: k8s-agent
 spec:
@@ -94,7 +102,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:latest
+        image: dipinthomas2003/k8s-deep-agent:v6
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -104,11 +112,160 @@ spec:
           value: "ap-southeast-2"
         - name: CLUSTER_NAME
           value: "otel-demo-prod"
+        - name: AGENT_MODEL
+          value: "openai:gpt-4.1-mini"
+        # Cluster-specific skill injected at deploy time — change this to switch clusters.
+        # Must point to a SKILL.md under skills/clusters/<name>/.
+        - name: CLUSTER_SKILL_PATH
+          value: "./skills/clusters/otel-demo-prod/SKILL.md"
+        # MCP sidecar URLs — sidecars run in the same pod so we use localhost.
+        - name: KUBECTL_MCP_URL
+          value: "http://localhost:3001/mcp"
+        - name: CLOUDWATCH_MCP_URL
+          value: "http://localhost:3002/mcp"
+        # Redis memory store — persists incident history across agent pod restarts.
+        - name: REDIS_URL
+          value: "redis://agent-redis.k8s-agent.svc.cluster.local:6379"
+        # IRSA: EKS automatically injects these two vars into pods whose
+        # ServiceAccount has the eks.amazonaws.com/role-arn annotation.
+        # The AWS SDK (boto3) picks them up via the default credential chain.
+        # AWS_ROLE_ARN            — injected by EKS
+        # AWS_WEB_IDENTITY_TOKEN_FILE — injected by EKS
+        ports:
+        - containerPort: 8080
+          name: http-trigger
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 30
         resources:
           requests:
-            memory: "512Mi"
+            memory: "256Mi"
             cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+
+      # ── MCP sidecars ──────────────────────────────────────────────────────────
+      # Running in the same pod so the agent connects via localhost — no network hop.
+      # The k8s-agent ServiceAccount provides both K8s RBAC and IRSA credentials.
+
+      - name: kubectl-mcp
+        image: dipinthomas2003/k8s-mcp-gateway:v2
+        command: ["supergateway"]
+        args:
+        - "--stdio"
+        - "mcp-server-kubernetes"
+        - "--port"
+        - "3001"
+        - "--outputTransport"
+        - "streamableHttp"
+        - "--stateful"
+        - "--healthEndpoint"
+        - "/healthz"
+        ports:
+        - containerPort: 3001
+          name: kubectl-mcp
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3001
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          failureThreshold: 5
+
+      - name: cloudwatch-mcp
+        image: dipinthomas2003/k8s-mcp-gateway:v2
+        command: ["supergateway"]
+        args:
+        - "--stdio"
+        - "uvx awslabs.cloudwatch-mcp-server@latest"
+        - "--port"
+        - "3002"
+        - "--outputTransport"
+        - "streamableHttp"
+        - "--stateful"
+        - "--healthEndpoint"
+        - "/healthz"
+        ports:
+        - containerPort: 3002
+          name: cloudwatch-mcp
+        env:
+        - name: AWS_REGION
+          value: "ap-southeast-2"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
           limits:
             memory: "1Gi"
             cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3002
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+
       priorityClassName: infrastructure
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-agent
+  namespace: k8s-agent
+spec:
+  type: LoadBalancer
+  selector:
+    app: k8s-agent
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http-trigger
+
+---
+# Cross-namespace: agent needs to read/evict pods in otel-demo (where the workloads run)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-agent-otel-demo-role
+  namespace: otel-demo
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch", "patch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-agent-otel-demo-binding
+  namespace: otel-demo
+subjects:
+- kind: ServiceAccount
+  name: k8s-agent
+  namespace: k8s-agent
+roleRef:
+  kind: Role
+  name: k8s-agent-otel-demo-role
+  apiGroup: rbac.authorization.k8s.io
