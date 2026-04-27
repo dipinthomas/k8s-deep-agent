@@ -106,7 +106,7 @@ spec:
         - name: CLUSTER_NAME
           value: "otel-demo-prod"
         - name: AGENT_MODEL
-          value: "openai:gpt-4.1"
+          value: "openai:gpt-5-mini"
         - name: LOG_LEVEL
           value: "DEBUG"
         # Cluster-specific skill injected at deploy time — change this to switch clusters.
