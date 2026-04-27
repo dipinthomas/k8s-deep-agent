@@ -50,22 +50,15 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 
 ---
-# Cluster-wide: agent needs full read/write access across all namespaces
-# (pods may be in any namespace; model may hallucinate namespace names)
+# Cluster-wide: full read/write access — agent investigates and remediates across all namespaces
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: k8s-agent-cluster-role
 rules:
-- apiGroups: [""]
-  resources: ["nodes", "namespaces", "pods", "pods/log", "pods/exec", "events", "services", "configmaps"]
-  verbs: ["get", "list", "watch", "delete", "create"]
-- apiGroups: ["apps"]
-  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
-  verbs: ["get", "list", "watch", "patch", "update"]
-- apiGroups: ["metrics.k8s.io"]
-  resources: ["nodes", "pods"]
-  verbs: ["get", "list"]
+- apiGroups: ["*"]
+  resources: ["*"]
+  verbs: ["*"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -102,7 +95,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v14
+        image: dipinthomas2003/k8s-deep-agent:v15
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -113,7 +106,7 @@ spec:
         - name: CLUSTER_NAME
           value: "otel-demo-prod"
         - name: AGENT_MODEL
-          value: "openai:gpt-4.1-mini"
+          value: "openai:gpt-4.1"
         - name: LOG_LEVEL
           value: "DEBUG"
         # Cluster-specific skill injected at deploy time — change this to switch clusters.
