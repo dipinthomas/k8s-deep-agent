@@ -7,6 +7,7 @@ Slack tools are Python-native to support the custom approval Block Kit UI.
 
 import logging
 import os
+from functools import wraps
 from deepagents import create_deep_agent
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -43,13 +44,13 @@ Non-negotiable rules:
 # Keywords in a tool NAME that signal it is destructive
 _DESTRUCTIVE_NAME_KEYWORDS = {
     "delete", "drain", "evict", "apply", "patch",
-    "scale", "restart", "create", "update", "replace",
+    "scale", "restart", "create", "update", "replace", "rollout",
 }
 
 # Keywords in a tool DESCRIPTION that signal it is destructive
 _DESTRUCTIVE_DESC_KEYWORDS = {
     "modif", "creat", "remov", "destroy", "delet",
-    "evict", "drain", "apply", "patch", "restart", "scale",
+    "evict", "drain", "apply", "patch", "restart", "scale", "rollout",
 }
 
 
@@ -75,6 +76,47 @@ def _build_interrupt_on(mcp_tools: list) -> dict:
     return interrupt_on
 
 
+_TUPLE_RESPONSE_FORMAT = "content_and_artifact"
+
+
+def _wrap_with_error_handling(tool):
+    """
+    Wrap an MCP tool so that exceptions are returned as error strings rather than
+    crashing the LangGraph graph. This makes MCP errors recoverable — the agent
+    sees the error message and can retry with a different tool call.
+
+    MCP tools from langchain_mcp_adapters use response_format='content_and_artifact',
+    which requires a (str, Any) tuple return. Plain strings crash the tool node.
+    """
+    needs_tuple = getattr(tool, "response_format", None) == _TUPLE_RESPONSE_FORMAT
+
+    def _error_response(e: Exception):
+        msg = f"Tool error: {type(e).__name__}: {e}"
+        return (msg, None) if needs_tuple else msg
+
+    original_coroutine = tool.coroutine
+    original_func = tool.func
+
+    if original_coroutine:
+        @wraps(original_coroutine)
+        async def safe_coroutine(*args, **kwargs):
+            try:
+                return await original_coroutine(*args, **kwargs)
+            except Exception as e:
+                return _error_response(e)
+        tool.coroutine = safe_coroutine
+    elif original_func:
+        @wraps(original_func)
+        def safe_func(*args, **kwargs):
+            try:
+                return original_func(*args, **kwargs)
+            except Exception as e:
+                return _error_response(e)
+        tool.func = safe_func
+
+    return tool
+
+
 CLUSTER_SKILL_PATH = os.environ.get("CLUSTER_SKILL_PATH", "")
 
 
@@ -84,7 +126,8 @@ def build_agent():
     seed_memory_store(store)
 
     # Load MCP tools from gateway pod (blocking — fetches tool schemas once at startup).
-    mcp_tools = get_mcp_tools()
+    # Wrap each tool so MCP errors are returned as strings rather than crashing the graph.
+    mcp_tools = [_wrap_with_error_handling(t) for t in get_mcp_tools()]
 
     # Human-in-the-loop sequence (must always happen in this order):
     #   1. Agent calls post_approval_request → posts evidence + buttons to Slack

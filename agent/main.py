@@ -34,10 +34,24 @@ agent = build_agent()
 
 CHANNEL = os.environ["SLACK_CHANNEL_ID"]
 
-# thread_ts → channel for every active investigation
-# Populated when /trigger starts, removed when approved/denied
-active_investigations: dict[str, str] = {}
+# thread_ts → (channel, start_time) for every active investigation.
+# Entries are removed on approve/deny; a background reaper cleans up
+# any that are abandoned (no button press) after INVESTIGATION_TTL seconds.
+INVESTIGATION_TTL = 4 * 3600  # 4 hours
+active_investigations: dict[str, tuple[str, float]] = {}
 _investigations_lock = threading.Lock()
+
+
+def _reap_stale_investigations():
+    """Remove investigations that have been open longer than INVESTIGATION_TTL."""
+    while True:
+        time.sleep(3600)
+        cutoff = time.time() - INVESTIGATION_TTL
+        with _investigations_lock:
+            stale = [ts for ts, (_, started) in active_investigations.items() if started < cutoff]
+            for ts in stale:
+                logger.info("Reaping stale investigation: thread_ts=%s", ts)
+                del active_investigations[ts]
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -115,7 +129,7 @@ http_app = Flask(__name__)
 
 def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
     with _investigations_lock:
-        active_investigations[thread_ts] = channel
+        active_investigations[thread_ts] = (channel, time.time())
 
     alarm_name = alarm.get("alarm_name", "unknown")
     reason = alarm.get("reason", "")
@@ -160,10 +174,10 @@ def trigger():
         return jsonify({"status": "ignored", "state": state}), 200
 
     logger.info("Alarm received via HTTP: %s", alarm)
-    thread_ts = str(time.time())
 
-    # Agent owns the opening Slack message
-    slack_app.client.chat_postMessage(
+    # Post the opening alert and capture the real Slack thread timestamp.
+    # All subsequent agent messages are posted as replies to this thread.
+    opening = slack_app.client.chat_postMessage(
         channel=CHANNEL,
         text=(
             f":red_circle: *ALERT: {alarm.get('alarm_name', 'CloudWatch alarm')} fired*\n"
@@ -172,6 +186,8 @@ def trigger():
             "_Starting investigation — reply in this thread to ask questions._"
         ),
     )
+    thread_ts = opening["ts"]
+    logger.info("Slack thread opened: %s", thread_ts)
 
     threading.Thread(
         target=run_investigation,
@@ -204,10 +220,11 @@ def handle_thread_reply(event, say):
         return
 
     with _investigations_lock:
-        channel = active_investigations.get(thread_ts)
+        entry = active_investigations.get(thread_ts)
 
-    if not channel:
+    if not entry:
         return  # not an active investigation thread
+    channel, _ = entry
 
     question = event.get("text", "").strip()
     if not question:
@@ -301,6 +318,8 @@ def handle_more_details(ack, body, say):
 
 
 if __name__ == "__main__":
+    threading.Thread(target=_reap_stale_investigations, daemon=True).start()
+
     # Flask HTTP server in background thread (receives Lambda triggers)
     threading.Thread(
         target=lambda: http_app.run(host="0.0.0.0", port=8080, use_reloader=False),

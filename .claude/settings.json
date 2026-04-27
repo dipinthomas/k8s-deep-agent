@@ -21,7 +21,26 @@
       "Bash(helm list *)",
       "Bash(docker images *)",
       "Bash(docker inspect *)",
-      "Bash(npx *)"
+      "Bash(npx *)",
+      "Bash(aws logs *)",
+      "Bash(AWS_PROFILE=* aws logs *)",
+      "Bash(aws lambda get-function-configuration *)",
+      "Bash(AWS_PROFILE=* aws lambda get-function-configuration *)",
+      "Bash(aws bedrock list-foundation-models *)",
+      "Bash(AWS_PROFILE=* aws bedrock list-foundation-models *)",
+      "Bash(aws configure list *)",
+      "Bash(aws dynamodb describe-table *)",
+      "Bash(AWS_PROFILE=* aws dynamodb describe-table *)",
+      "Bash(aws s3 ls *)",
+      "Bash(AWS_PROFILE=* aws s3 ls *)",
+      "Bash(docker ps *)",
+      "Bash(docker logs *)",
+      "Bash(docker manifest inspect *)",
+      "Bash(docker buildx ls *)",
+      "Bash(curl -s *)",
+      "Bash(curl -sf *)",
+      "Bash(curl -s -X POST *)",
+      "Bash(curl -sf -X POST *)"
     ]
   }
 }

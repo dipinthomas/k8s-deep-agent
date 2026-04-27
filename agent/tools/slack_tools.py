@@ -4,10 +4,12 @@ Used to post investigation updates, approval requests, and resolution summaries.
 """
 
 import os
-import json
+import logging
 from langchain_core.tools import tool
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+
+logger = logging.getLogger(__name__)
 
 _client = None
 
@@ -23,6 +25,22 @@ def _channel() -> str:
     return os.environ.get("SLACK_CHANNEL_ID", "#k8s-alerts")
 
 
+def _post(label: str, thread_ts: str, **kwargs) -> tuple[str, str | None]:
+    """Post to Slack with consistent logging. Returns (result_str, ts_or_None)."""
+    logger.info("%s called: thread_ts=%r", label, thread_ts)
+    if thread_ts:
+        kwargs["thread_ts"] = thread_ts
+    kwargs.setdefault("channel", _channel())
+    try:
+        response = _slack().chat_postMessage(**kwargs)
+        logger.info("%s succeeded: ts=%s", label, response["ts"])
+        return response["ts"], None
+    except SlackApiError as e:
+        err = e.response["error"]
+        logger.error("%s Slack API error: %s", label, err)
+        return None, err
+
+
 @tool
 def post_to_slack(message: str, thread_ts: str = "") -> str:
     """
@@ -33,19 +51,8 @@ def post_to_slack(message: str, thread_ts: str = "") -> str:
         thread_ts: Thread timestamp to reply in a thread (optional).
                    If empty, posts as a new top-level message.
     """
-    try:
-        kwargs = {
-            "channel": _channel(),
-            "text": message,
-            "mrkdwn": True,
-        }
-        if thread_ts:
-            kwargs["thread_ts"] = thread_ts
-
-        response = _slack().chat_postMessage(**kwargs)
-        return f"Posted to Slack (ts={response['ts']})"
-    except SlackApiError as e:
-        return f"Slack error: {e.response['error']}"
+    ts, err = _post("post_to_slack", thread_ts, text=message, mrkdwn=True)
+    return f"Slack error: {err}" if err else f"Posted to Slack (ts={ts})"
 
 
 # Called by the agent BEFORE attempting a destructive tool call.
@@ -133,19 +140,14 @@ def post_approval_request(
         },
     ]
 
-    try:
-        kwargs = {
-            "channel": _channel(),
-            "text": f"⚠️ Approval required: {summary}",
-            "blocks": blocks,
-        }
-        if thread_ts:
-            kwargs["thread_ts"] = thread_ts
-
-        response = _slack().chat_postMessage(**kwargs)
-        return (
-            f"Approval request posted (ts={response['ts']}). "
-            "Waiting for human response via Slack button click."
-        )
-    except SlackApiError as e:
-        return f"Slack error posting approval request: {e.response['error']}"
+    ts, err = _post(
+        "post_approval_request", thread_ts,
+        text=f"⚠️ Approval required: {summary}",
+        blocks=blocks,
+    )
+    if err:
+        return f"Slack error posting approval request: {err}"
+    return (
+        f"Approval request posted (ts={ts}). "
+        "Waiting for human response via Slack button click."
+    )

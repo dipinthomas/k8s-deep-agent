@@ -102,7 +102,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v6
+        image: dipinthomas2003/k8s-deep-agent:v12
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -225,6 +225,9 @@ kind: Service
 metadata:
   name: k8s-agent
   namespace: k8s-agent
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
 spec:
   type: LoadBalancer
   selector:
