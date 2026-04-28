@@ -11,17 +11,28 @@ Entry points:
      Agent answers and re-posts the approval block so the button stays live.
 
   3. Slack button actions — APPROVE / DENY / MORE DETAILS resume the workflow.
+
+Architecture note — single persistent event loop:
+  All async work (MCP tool calls, agent streaming) runs in _agent_loop,
+  a dedicated background thread that never exits. MCP tool objects hold HTTP
+  sessions bound to the loop they were created in; using asyncio.run() for each
+  call creates a new loop and leaves those sessions dead. The fix is one loop,
+  always alive, with all coroutines submitted via asyncio.run_coroutine_threadsafe().
 """
 
 import asyncio
+import json
 import os
 import time
 import logging
 import threading
+from concurrent.futures import Future
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+from langgraph.types import Command
+import redis as redis_lib
 
 load_dotenv()
 
@@ -60,31 +71,151 @@ for _noisy in ("httpx", "httpcore", "urllib3", "botocore", "boto3"):
 
 logger = logging.getLogger(__name__)
 
-from agent import build_agent
+# ── Persistent event loop ──────────────────────────────────────────────────────
+# One loop runs for the lifetime of the process in its own daemon thread.
+# All coroutines (MCP tool loading, agent streaming) are submitted here.
+# This ensures MCP HTTP sessions created during startup remain valid forever.
 
-slack_app = App(token=os.environ["SLACK_BOT_TOKEN"])
-agent = build_agent()
+_agent_loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
 
-CHANNEL = os.environ["SLACK_CHANNEL_ID"]
 
-# thread_ts → (channel, start_time) for every active investigation.
-# Entries are removed on approve/deny; a background reaper cleans up
-# any that are abandoned (no button press) after INVESTIGATION_TTL seconds.
+def _start_agent_loop():
+    asyncio.set_event_loop(_agent_loop)
+    _agent_loop.run_forever()
+
+
+def run_async(coro) -> Future:
+    """Submit a coroutine to the persistent agent loop and return a Future.
+    Call .result() to block until done (raises on exception)."""
+    return asyncio.run_coroutine_threadsafe(coro, _agent_loop)
+
+
+from agent import build_agent_async
+
+# These get assigned during bootstrap() inside __main__ so that importing this
+# module (e.g. from a test or a tool) does not trigger network calls or crash
+# on missing env vars.
+slack_app: App | None = None
+agent = None
+CHANNEL: str = ""
+_redis: redis_lib.Redis | None = None
+
 INVESTIGATION_TTL = 4 * 3600  # 4 hours
-active_investigations: dict[str, tuple[str, float]] = {}
-_investigations_lock = threading.Lock()
+
+_REDIS_INVESTIGATIONS_KEY = "k8s_agent:active_investigations"
+
+
+def bootstrap() -> None:
+    """Initialise the persistent loop, Slack app, agent, and Redis client.
+    Called once from __main__ — never at import time."""
+    global slack_app, agent, CHANNEL, _redis
+
+    threading.Thread(target=_start_agent_loop, daemon=True, name="agent-loop").start()
+
+    slack_app = App(token=os.environ["SLACK_BOT_TOKEN"])
+    CHANNEL = os.environ["SLACK_CHANNEL_ID"]
+
+    # Redis client — probe with retries so a slow Redis start doesn't crash the agent.
+    _redis = redis_lib.from_url(
+        os.environ.get("REDIS_URL", "redis://localhost:6379"), decode_responses=True
+    )
+    for _attempt in range(10):
+        try:
+            _redis.ping()
+            logger.info("Redis ready (attempt %d)", _attempt + 1)
+            break
+        except Exception as _e:
+            logger.warning("Redis not ready (attempt %d/10): %s — retrying in 3s", _attempt + 1, _e)
+            time.sleep(3)
+    else:
+        logger.error("Redis unavailable after 10 attempts — investigation persistence disabled")
+
+    logger.info("Bootstrapping agent inside persistent event loop...")
+    agent = run_async(build_agent_async()).result()
+    logger.info("Agent ready.")
+
+    # Register Slack handlers on the now-initialised slack_app.
+    _register_slack_handlers()
+
+
+def _investigations_get(thread_ts: str) -> tuple[str, float] | None:
+    try:
+        raw = _redis.hget(_REDIS_INVESTIGATIONS_KEY, thread_ts)
+    except Exception:
+        return None
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    return data["channel"], data["started"]
+
+
+def _investigations_set(thread_ts: str, channel: str, started: float) -> None:
+    try:
+        _redis.hset(_REDIS_INVESTIGATIONS_KEY, thread_ts, json.dumps({"channel": channel, "started": started}))
+    except Exception:
+        logger.warning("Redis unavailable — could not persist investigation thread_ts=%s", thread_ts)
+
+
+def _investigations_delete(thread_ts: str) -> None:
+    try:
+        _redis.hdel(_REDIS_INVESTIGATIONS_KEY, thread_ts)
+    except Exception:
+        logger.warning("Redis unavailable — could not delete investigation thread_ts=%s", thread_ts)
+
+
+def _investigations_all() -> dict[str, tuple[str, float]]:
+    try:
+        raw = _redis.hgetall(_REDIS_INVESTIGATIONS_KEY)
+    except Exception:
+        logger.warning("Redis unavailable — returning empty investigations map")
+        return {}
+    result = {}
+    for ts, val in raw.items():
+        data = json.loads(val)
+        result[ts] = (data["channel"], data["started"])
+    return result
 
 
 def _reap_stale_investigations():
-    """Remove investigations that have been open longer than INVESTIGATION_TTL."""
+    """Remove investigations open longer than INVESTIGATION_TTL from Redis."""
     while True:
         time.sleep(3600)
         cutoff = time.time() - INVESTIGATION_TTL
-        with _investigations_lock:
-            stale = [ts for ts, (_, started) in active_investigations.items() if started < cutoff]
-            for ts in stale:
+        for ts, (_, started) in list(_investigations_all().items()):
+            if started < cutoff:
                 logger.info("Reaping stale investigation: thread_ts=%s", ts)
-                del active_investigations[ts]
+                _investigations_delete(ts)
+
+
+def _recover_paused_investigations():
+    """
+    On startup: find any investigations still in Redis (surviving a pod restart).
+    Since the graph checkpoint is in-memory and lost on restart, notify the Slack
+    thread that the agent restarted and the investigation needs to be re-triggered.
+    """
+    investigations = _investigations_all()
+    if not investigations:
+        return
+    logger.info("Found %d investigation(s) in Redis after restart — notifying Slack", len(investigations))
+    for thread_ts, (channel, started) in list(investigations.items()):
+        age_hours = (time.time() - started) / 3600
+        if age_hours > INVESTIGATION_TTL / 3600:
+            logger.info("Dropping expired investigation thread_ts=%s (%.1fh old)", thread_ts, age_hours)
+            _investigations_delete(thread_ts)
+            continue
+        logger.info("Notifying restart for thread_ts=%s", thread_ts)
+        try:
+            slack_app.client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=(
+                    ":warning: Agent pod restarted and lost in-memory state. "
+                    "Please re-trigger the investigation via a new alarm."
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to notify restart for thread_ts=%s", thread_ts)
+        _investigations_delete(thread_ts)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -99,23 +230,265 @@ def agent_config(thread_ts: str, channel: str) -> dict:
     }
 
 
-def stream_agent(messages, thread_ts: str, channel: str) -> None:
-    """Run the agent and stream chunks. Uses astream() via asyncio.run() because
-    MCP tools are async-only and cannot be invoked synchronously.
+# Hard ceiling for a single agent.astream() call. The underlying LLM client has
+# its own per-HTTP-call timeout (LLM_TIMEOUT_SEC, see agent.py); this is the
+# ceiling for an *entire turn* (model call + tool dispatch + sub-stream). Bigger
+# than the HTTP timeout because a turn legitimately makes multiple model calls.
+_STREAM_TIMEOUT_SEC = float(os.environ.get("STREAM_TIMEOUT_SEC", "600"))
 
-    Pass messages=None to resume a graph paused at an interrupt_on gate without
-    injecting a new user message — this lets the queued tool call execute directly.
-    Pass a list of message dicts to start a new turn or continue after a denial.
+# How often the watchdog thread reminds Slack the agent is still working.
+_HEARTBEAT_INTERVAL_SEC = float(os.environ.get("HEARTBEAT_INTERVAL_SEC", "60"))
+
+
+def _heartbeat_loop(thread_ts: str, channel: str, stop_event: threading.Event, started_at: float) -> None:
+    """Post a single 'still working' message every HEARTBEAT_INTERVAL_SEC until
+    stop_event is set. Failures here are non-fatal — heartbeats are best-effort."""
+    while not stop_event.wait(_HEARTBEAT_INTERVAL_SEC):
+        elapsed = int(time.time() - started_at)
+        try:
+            slack_app.client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=f":hourglass_flowing_sand: Still investigating… {elapsed}s elapsed.",
+            )
+        except Exception:
+            logger.warning("Heartbeat post failed for thread_ts=%s", thread_ts, exc_info=False)
+
+
+def stream_agent(payload, thread_ts: str, channel: str) -> None:
+    """Submit the agent coroutine to the persistent loop and block until done.
+
+    `payload` may be:
+      - a list of message dicts → a new turn on this thread
+      - a langgraph.types.Command → resumes a graph paused at an interrupt
+      - None → re-enters the graph with no new input
+
+    Hard-capped by _STREAM_TIMEOUT_SEC so a stalled LLM stream cannot pin the
+    worker thread indefinitely. On timeout or any astream() exception, posts
+    the failure to Slack and re-raises so callers can clean up state.
     """
     config = agent_config(thread_ts, channel)
-    # None resumes the interrupted graph; a message list starts/continues a turn.
-    input_payload = None if messages is None else {"messages": messages}
+    if payload is None:
+        input_payload = None
+    elif isinstance(payload, Command):
+        input_payload = payload
+    else:
+        input_payload = {"messages": payload}
+
+    # Track whether the model called post_to_slack / post_approval_request this
+    # turn. If the turn ends with a plain-text AIMessage and neither was called,
+    # the user would never see anything — we post the text ourselves as a
+    # fallback so heartbeat-only stalls become impossible.
+    posted_to_slack = {"value": False}
 
     async def _run():
-        async for chunk in agent.astream(input_payload, config):
-            logger.debug("Agent chunk: %s", chunk)
+        async def _drive():
+            async for chunk in agent.astream(input_payload, config):
+                logger.debug("Agent chunk: %s", chunk)
+                _scan_chunk_for_slack_posts(chunk, posted_to_slack)
+        await asyncio.wait_for(_drive(), timeout=_STREAM_TIMEOUT_SEC)
 
-    asyncio.run(_run())
+    started = time.time()
+    stop_hb = threading.Event()
+    hb_thread = threading.Thread(
+        target=_heartbeat_loop, args=(thread_ts, channel, stop_hb, started), daemon=True,
+    )
+    hb_thread.start()
+    try:
+        run_async(_run()).result()
+        if not posted_to_slack["value"]:
+            _safety_net_post_final_message(thread_ts, channel)
+    except asyncio.TimeoutError:
+        elapsed = int(time.time() - started)
+        logger.error("stream_agent timed out after %ds for thread_ts=%s", elapsed, thread_ts)
+        _post_thread_error(
+            channel, thread_ts, f"Agent step timed out after {elapsed}s",
+            RuntimeError(f"No response within {int(_STREAM_TIMEOUT_SEC)}s"),
+        )
+        raise
+    except Exception as e:
+        logger.exception("stream_agent failed for thread_ts=%s", thread_ts)
+        _post_thread_error(channel, thread_ts, "Agent step", e)
+        raise
+    finally:
+        stop_hb.set()
+
+
+_SLACK_TOOL_NAMES = {"post_to_slack", "post_approval_request"}
+
+
+def _scan_chunk_for_slack_posts(chunk, flag: dict) -> None:
+    """Set flag['value']=True if any AIMessage tool_call in this chunk targets
+    post_to_slack or post_approval_request. We intentionally over-detect: any
+    occurrence in any node is enough."""
+    if flag["value"]:
+        return
+    try:
+        for node_state in (chunk.values() if isinstance(chunk, dict) else ()):
+            if not isinstance(node_state, dict):
+                continue
+            for msg in node_state.get("messages", []) or []:
+                tool_calls = getattr(msg, "tool_calls", None) or []
+                for tc in tool_calls:
+                    name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                    if name in _SLACK_TOOL_NAMES:
+                        flag["value"] = True
+                        return
+    except Exception:
+        # Detection is best-effort — never break the stream over it.
+        pass
+
+
+def _safety_net_post_final_message(thread_ts: str, channel: str) -> None:
+    """When a turn ends without calling post_to_slack, fetch the final state's
+    last AIMessage and post its text content (if any) so the user sees SOMETHING.
+    This preserves the demo invariant: every alarm produces a visible response."""
+    config = agent_config(thread_ts, channel)
+
+    async def _get_state():
+        return await agent.aget_state(config)
+
+    try:
+        state = run_async(_get_state()).result()
+    except Exception:
+        logger.exception("Safety-net: could not read graph state for thread_ts=%s", thread_ts)
+        return
+
+    values = getattr(state, "values", None) or {}
+    messages = values.get("messages") if isinstance(values, dict) else None
+    if not messages:
+        return
+
+    last = messages[-1]
+    # Only fire on a final AIMessage that is plain text and has no tool_calls
+    # left to run — otherwise the graph isn't really "done" and a manual post
+    # would interleave badly with the next chunk.
+    is_ai = type(last).__name__ in ("AIMessage", "AIMessageChunk")
+    has_tool_calls = bool(getattr(last, "tool_calls", None))
+    text = ""
+    raw = getattr(last, "content", "")
+    if isinstance(raw, str):
+        text = raw.strip()
+    elif isinstance(raw, list):
+        text = "\n".join(p.get("text", "") for p in raw if isinstance(p, dict)).strip()
+
+    if not (is_ai and not has_tool_calls and text):
+        return
+
+    logger.warning(
+        "Safety-net: model ended turn with plain text and no post_to_slack call — "
+        "posting final AIMessage to thread_ts=%s ourselves", thread_ts,
+    )
+    try:
+        slack_app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f":robot_face: _(auto-delivered final response)_\n\n{text}",
+        )
+    except Exception:
+        logger.exception("Safety-net: failed to post final message")
+
+
+def _pending_interrupt_action_count(thread_ts: str, channel: str) -> int:
+    """Return the number of action_requests inside the pending HITL interrupt.
+
+    LangChain's HumanInTheLoopMiddleware bundles ALL gated tool calls from a
+    single AIMessage into ONE interrupt() call whose payload looks like:
+
+        {"action_requests": [...], "review_configs": [...]}
+
+    The middleware then validates that the resume payload's `decisions` list has
+    exactly len(action_requests) entries — mismatch raises ValueError, and the
+    graph silently exits the resume tick (which is the v26 bug we hit).
+
+    So the correct decision count is len(action_requests) per pending interrupt,
+    summed across pending interrupts. Returns 0 if state lookup fails or no
+    interrupt is pending — the resume in that case will likely no-op cleanly,
+    which is also fine.
+    """
+    config = agent_config(thread_ts, channel)
+
+    async def _get_state():
+        return await agent.aget_state(config)
+
+    try:
+        state = run_async(_get_state()).result()
+    except Exception:
+        logger.exception("Failed to read graph state for thread_ts=%s", thread_ts)
+        return 0
+
+    interrupts = []
+    tasks = getattr(state, "tasks", None) or ()
+    for t in tasks:
+        interrupts.extend(getattr(t, "interrupts", ()) or ())
+    if not interrupts:
+        interrupts = list(getattr(state, "interrupts", ()) or ())
+
+    if not interrupts:
+        # Nothing pending — log the last AIMessage's gated tool calls so we can
+        # see whether the model proposed a tool but the interrupt didn't persist.
+        _log_last_ai_tool_calls(state, "no pending interrupt found")
+        return 0
+
+    total = 0
+    for i, intr in enumerate(interrupts):
+        value = getattr(intr, "value", None)
+        action_requests = []
+        if isinstance(value, dict):
+            action_requests = value.get("action_requests") or []
+        n = len(action_requests)
+        total += n
+        try:
+            names = [a.get("name") for a in action_requests if isinstance(a, dict)]
+        except Exception:
+            names = []
+        logger.info(
+            "Pending interrupt #%d for thread_ts=%s: %d action(s) %s",
+            i, thread_ts, n, names,
+        )
+    return total
+
+
+def _log_last_ai_tool_calls(state, why: str) -> None:
+    try:
+        values = getattr(state, "values", None) or {}
+        messages = values.get("messages") if isinstance(values, dict) else None
+        if not messages:
+            logger.warning("%s; state has no messages", why)
+            return
+        last_ai = next(
+            (m for m in reversed(messages) if type(m).__name__ in ("AIMessage", "AIMessageChunk")),
+            None,
+        )
+        if last_ai is None:
+            logger.warning("%s; no AIMessage in state", why)
+            return
+        tcs = getattr(last_ai, "tool_calls", None) or []
+        names = [tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None) for tc in tcs]
+        logger.warning("%s; last AIMessage tool_calls=%s", why, names)
+    except Exception:
+        logger.exception("Failed to introspect last AIMessage")
+
+
+def _resume_command(decision_type: str, thread_ts: str, channel: str) -> Command:
+    """Build a Command(resume={"decisions": [...]}) with EXACTLY as many
+    decisions as the pending interrupt requested action_requests for. The
+    HumanInTheLoopMiddleware ValueError-rejects any mismatch, so getting this
+    count right is non-negotiable."""
+    n = _pending_interrupt_action_count(thread_ts, channel)
+    if n == 0:
+        # No pending interrupt — sending decisions=[] is the cleanest no-op
+        # (LangGraph treats an empty-decisions resume as continue-from-checkpoint).
+        logger.warning(
+            "Resuming thread_ts=%s with %s but found NO pending interrupts — "
+            "this resume will likely be a no-op; the gated tool will not execute.",
+            thread_ts, decision_type,
+        )
+        return Command(resume={"decisions": []})
+
+    decisions = [{"type": decision_type} for _ in range(n)]
+    logger.info("Resuming thread_ts=%s with %d %s decision(s)", thread_ts, n, decision_type)
+    return Command(resume={"decisions": decisions})
 
 
 def post_approval_block(channel: str, thread_ts: str) -> None:
@@ -168,8 +541,7 @@ http_app = Flask(__name__)
 
 
 def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
-    with _investigations_lock:
-        active_investigations[thread_ts] = (channel, time.time())
+    _investigations_set(thread_ts, channel, time.time())
 
     alarm_name = alarm.get("alarm_name", "unknown")
     reason = alarm.get("reason", "")
@@ -190,18 +562,10 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
             thread_ts,
             channel,
         )
-    except Exception as e:
-        logger.exception("Investigation failed: %s", e)
-        with _investigations_lock:
-            active_investigations.pop(thread_ts, None)
-        try:
-            slack_app.client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_ts,
-                text=f":x: Investigation failed: `{type(e).__name__}: {e}`",
-            )
-        except Exception:
-            pass
+    except Exception:
+        # stream_agent already posted the failure to the thread.
+        logger.exception("Investigation failed for thread_ts=%s", thread_ts)
+        _investigations_delete(thread_ts)
 
 
 @http_app.route("/trigger", methods=["POST"])
@@ -243,128 +607,173 @@ def healthz():
     return jsonify({"status": "ok"}), 200
 
 
-# ── Slack thread replies — conversational Q&A before approval ─────────────────
+# ── Slack handler registration ────────────────────────────────────────────────
+# Handlers are registered inside a function (not at import time) because
+# slack_app is constructed in bootstrap(), not at module load.
 
-@slack_app.event("message")
-def handle_thread_reply(event, say):
-    """
-    Handles free-form questions posted in an active investigation thread.
-    The agent answers the question, then re-posts the approval buttons.
-    """
-    thread_ts = event.get("thread_ts")
-    bot_id = event.get("bot_id")
-    subtype = event.get("subtype")
-
-    # Ignore: not a thread reply, bot messages, message edits/deletes
-    if not thread_ts or bot_id or subtype:
-        return
-
-    with _investigations_lock:
-        entry = active_investigations.get(thread_ts)
-
-    if not entry:
-        return  # not an active investigation thread
-    channel, _ = entry
-
-    question = event.get("text", "").strip()
-    if not question:
-        return
-
-    user = event.get("user", "someone")
-    logger.info("Thread question from %s: %s", user, question)
-
-    def answer_and_repost():
-        stream_agent(
-            [{"role": "user", "content": f"@{user} asks: {question}"}],
-            thread_ts,
-            channel,
+def _post_thread_error(channel: str, thread_ts: str, where: str, exc: Exception) -> None:
+    try:
+        slack_app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=f":x: {where} failed: `{type(exc).__name__}: {exc}`",
         )
-        post_approval_block(channel, thread_ts)
-
-    threading.Thread(target=answer_and_repost, daemon=True).start()
-
-
-# ── Slack button handlers — resume paused LangGraph workflow ──────────────────
-
-# Resumes the paused LangGraph graph after human approval.
-# The graph was frozen at the interrupt_on gate in agent.py.
-# Feeding a message into stream_agent with the same thread_id/config
-# resumes execution from exactly where it paused.
-@slack_app.action("agent_approve")
-def handle_approve(ack, body, say):
-    ack()
-    thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
-    channel = body["channel"]["id"]
-    user = body["user"]["name"]
-
-    with _investigations_lock:
-        active_investigations.pop(thread_ts, None)
-
-    logger.info("Action approved by %s", user)
-    say(text=f"✅ Approved by @{user}. Proceeding...", thread_ts=thread_ts, channel=channel)
-
-    # Resume the paused LangGraph graph with None — this clears the interrupt_on gate
-    # and lets the already-queued tool call execute without re-invoking the model.
-    # Passing a user message here causes the model to re-plan and re-trigger the interrupt.
-    threading.Thread(
-        target=stream_agent,
-        args=(None, thread_ts, channel),
-        daemon=True,
-    ).start()
+    except Exception:
+        logger.exception("Failed to post error to Slack thread")
 
 
-@slack_app.action("agent_deny")
-def handle_deny(ack, body, say):
-    ack()
-    thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
-    channel = body["channel"]["id"]
-    user = body["user"]["name"]
+def _register_slack_handlers() -> None:
+    @slack_app.event("message")
+    def handle_thread_reply(event, say):
+        """Free-form questions in an active investigation thread.
+        The agent answers, then re-posts the approval buttons."""
+        thread_ts = event.get("thread_ts")
+        bot_id = event.get("bot_id")
+        subtype = event.get("subtype")
 
-    with _investigations_lock:
-        active_investigations.pop(thread_ts, None)
+        # Ignore: not a thread reply, bot messages, message edits/deletes
+        if not thread_ts or bot_id or subtype:
+            return
 
-    logger.info("Action denied by %s", user)
-    say(text=f"🚫 Denied by @{user}. Standing down.", thread_ts=thread_ts, channel=channel)
+        entry = _investigations_get(thread_ts)
+        if not entry:
+            return
+        channel, _ = entry
 
-    threading.Thread(
-        target=stream_agent,
-        args=(
-            [{"role": "user", "content": "DENIED — do not proceed. Summarise findings and stand down."}],
-            thread_ts,
-            channel,
-        ),
-        daemon=True,
-    ).start()
+        question = event.get("text", "").strip()
+        if not question:
+            return
+
+        user = event.get("user", "someone")
+        logger.info("Thread question from %s: %s", user, question)
+
+        def answer_and_repost():
+            try:
+                stream_agent(
+                    [{"role": "user", "content": f"@{user} asks: {question}"}],
+                    thread_ts,
+                    channel,
+                )
+                post_approval_block(channel, thread_ts)
+            except Exception:
+                # stream_agent already posted the failure to the thread.
+                logger.exception("Thread reply handling failed")
+
+        threading.Thread(target=answer_and_repost, daemon=True).start()
+
+    # APPROVE → resume the paused interrupt with an "approve" decision per pending
+    # tool call. This lets the queued kubectl_delete (or whichever destructive tool
+    # was gated) execute with its original args. We must NOT inject a new
+    # HumanMessage — that creates a new turn on the same thread, the model
+    # re-investigates from scratch, re-proposes the tool, and the gate fires again
+    # in a loop. See bug report 2026-04-28.
+    @slack_app.action("agent_approve")
+    def handle_approve(ack, body, say):
+        ack()
+        thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
+        channel = body["channel"]["id"]
+        user = body["user"]["name"]
+
+        logger.info("Action approved by %s", user)
+        say(text=f"✅ Approved by @{user}. Proceeding...", thread_ts=thread_ts, channel=channel)
+
+        def _resume():
+            try:
+                stream_agent(
+                    _resume_command("approve", thread_ts, channel),
+                    thread_ts,
+                    channel,
+                )
+            except Exception:
+                logger.exception("Approve resume failed")
+            finally:
+                _investigations_delete(thread_ts)
+
+        threading.Thread(target=_resume, daemon=True).start()
+
+    # DENY → resume with "reject" so the gated tool call is skipped entirely.
+    # The agent receives the rejection in its tool result and continues (typically
+    # by summarising and standing down per the system prompt).
+    @slack_app.action("agent_deny")
+    def handle_deny(ack, body, say):
+        ack()
+        thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
+        channel = body["channel"]["id"]
+        user = body["user"]["name"]
+
+        logger.info("Action denied by %s", user)
+        say(text=f"🚫 Denied by @{user}. Standing down.", thread_ts=thread_ts, channel=channel)
+
+        def _resume():
+            try:
+                stream_agent(
+                    _resume_command("reject", thread_ts, channel),
+                    thread_ts,
+                    channel,
+                )
+            except Exception:
+                logger.exception("Deny resume failed")
+            finally:
+                _investigations_delete(thread_ts)
+
+        threading.Thread(target=_resume, daemon=True).start()
+
+    # MORE_DETAILS → user-visible ack first, then a Q&A turn. We must not start a
+    # fresh stream while an interrupt is pending — that re-trips the gate and the
+    # explanation never gets posted. Instead: if pending, reject the queued tool
+    # call(s) so the graph cleanly returns control to the model, then ask the
+    # follow-up question. The agent will explain and re-propose if it still wants
+    # the action, re-firing the gate (and giving the user fresh buttons).
+    @slack_app.action("agent_more_details")
+    def handle_more_details(ack, body, say):
+        ack()
+        thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
+        channel = body["channel"]["id"]
+
+        say(text="🔍 Pulling more detail…", thread_ts=thread_ts, channel=channel)
+
+        def _details():
+            try:
+                # If the graph is paused at a gate, clear the interrupt by
+                # rejecting the queued tool call(s) before asking for explanation.
+                # Otherwise astream() would resume into the same gate and re-pause.
+                if _pending_interrupt_action_count(thread_ts, channel) > 0:
+                    stream_agent(
+                        _resume_command("reject", thread_ts, channel),
+                        thread_ts,
+                        channel,
+                    )
+                stream_agent(
+                    [{"role": "user", "content":
+                        "Provide more detail about your findings — do not "
+                        "execute any tool yet, just explain. After explaining, "
+                        "re-propose the recommended action so I can decide."}],
+                    thread_ts,
+                    channel,
+                )
+                post_approval_block(channel, thread_ts)
+            except Exception:
+                # stream_agent already posted the failure to the thread.
+                logger.exception("More-details handling failed")
+
+        threading.Thread(target=_details, daemon=True).start()
 
 
-@slack_app.action("agent_more_details")
-def handle_more_details(ack, body, say):
-    ack()
-    thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
-    channel = body["channel"]["id"]
-
-    threading.Thread(
-        target=lambda: (
-            stream_agent(
-                [{"role": "user", "content": "Provide more detail about your findings."}],
-                thread_ts,
-                channel,
-            ),
-            post_approval_block(channel, thread_ts),
-        ),
-        daemon=True,
-    ).start()
+def _serve_http() -> None:
+    """Serve the Flask trigger endpoint with a multi-threaded WSGI server so
+    /healthz never blocks behind a /trigger in flight."""
+    from waitress import serve
+    serve(http_app, host="0.0.0.0", port=8080, threads=8)
 
 
 if __name__ == "__main__":
+    bootstrap()
+    _recover_paused_investigations()
     threading.Thread(target=_reap_stale_investigations, daemon=True).start()
 
-    # Flask HTTP server in background thread (receives Lambda triggers)
-    threading.Thread(
-        target=lambda: http_app.run(host="0.0.0.0", port=8080, use_reloader=False),
-        daemon=True,
-    ).start()
-    logger.info("HTTP trigger endpoint listening on :8080")
+    # waitress in background thread (receives Lambda triggers)
+    threading.Thread(target=_serve_http, daemon=True).start()
+    logger.info("HTTP trigger endpoint listening on :8080 (waitress, 8 threads)")
 
     # Slack Socket Mode blocks the main thread
     logger.info("Starting Slack Socket Mode handler...")

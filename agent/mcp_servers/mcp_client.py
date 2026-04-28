@@ -15,17 +15,25 @@ uses custom Block Kit that is not in the generic Slack MCP server.
 
 Local dev: set KUBECTL_MCP_URL and CLOUDWATCH_MCP_URL to point at locally-running
 MCP servers.
+
+IMPORTANT: get_mcp_tools_async() must be called from within the persistent event loop
+(via the _agent_loop in main.py). Tool objects hold HTTP sessions bound to the loop
+they were created in — calling them from a different loop causes silent hangs.
 """
 
 import asyncio
 import logging
 import os
-import threading
 from typing import Any
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
 logger = logging.getLogger(__name__)
+
+# Sidecar MCP servers may take a few seconds longer to be ready than the agent
+# container. Retry tool loading so a slow sidecar doesn't crash bootstrap.
+_MCP_LOAD_ATTEMPTS = 20
+_MCP_LOAD_BACKOFF_SEC = 3
 
 _SERVER_CONFIG: dict[str, Any] = {
     "kubectl": {
@@ -45,42 +53,34 @@ _SERVER_CONFIG: dict[str, Any] = {
 }
 
 
-def _load_tools_sync() -> list[Any]:
+async def get_mcp_tools_async() -> list[Any]:
     """
-    Load MCP tools synchronously by running an event loop to completion.
-    MultiServerMCPClient.get_tools() opens sessions, fetches the tool list,
-    and cleanly closes them — all within a single asyncio.run() call.
+    Load MCP tools asynchronously. MUST be awaited from within the persistent
+    agent event loop so the returned tool objects' HTTP sessions are bound to
+    that loop and remain valid for the lifetime of the process.
+
+    Retries on failure — sidecars often need a few extra seconds to bind their
+    ports after the agent container starts.
     """
-    async def _fetch():
-        client = MultiServerMCPClient(_SERVER_CONFIG)
-        return await client.get_tools()
-
-    return asyncio.run(_fetch())
-
-
-_all_tools: list[Any] = []
-_tools_lock = threading.Lock()
-_tools_loaded = False
-
-
-def get_mcp_tools() -> list[Any]:
-    """
-    Return cached MCP tools, loading them on first call (blocking).
-
-    Tool schemas are fetched once at startup. The MCP gateway serves them
-    statelessly — each get_tools() call opens a fresh session, fetches the list,
-    and closes it cleanly.
-    """
-    global _all_tools, _tools_loaded
-    if not _tools_loaded:
-        with _tools_lock:
-            if not _tools_loaded:
-                logger.info("Loading MCP tools from gateway...")
-                _all_tools = _load_tools_sync()
-                _tools_loaded = True
-                logger.info(
-                    "MCP ready — %d tools loaded: %s",
-                    len(_all_tools),
-                    [t.name for t in _all_tools],
-                )
-    return list(_all_tools)
+    client = MultiServerMCPClient(_SERVER_CONFIG)
+    last_exc: Exception | None = None
+    for attempt in range(1, _MCP_LOAD_ATTEMPTS + 1):
+        try:
+            logger.info("Loading MCP tools (attempt %d/%d)...", attempt, _MCP_LOAD_ATTEMPTS)
+            tools = await client.get_tools()
+            logger.info(
+                "MCP ready — %d tools loaded: %s",
+                len(tools),
+                [t.name for t in tools],
+            )
+            return tools
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                "MCP tool load failed (attempt %d/%d): %s — retrying in %ds",
+                attempt, _MCP_LOAD_ATTEMPTS, e, _MCP_LOAD_BACKOFF_SEC,
+            )
+            await asyncio.sleep(_MCP_LOAD_BACKOFF_SEC)
+    raise RuntimeError(
+        f"MCP tool load failed after {_MCP_LOAD_ATTEMPTS} attempts"
+    ) from last_exc

@@ -92,8 +92,8 @@ LAMBDA_LOG_GROUP="/aws/lambda/${LAMBDA_NAME}"
 if check aws logs describe-log-groups \
     --log-group-name-prefix "$LAMBDA_LOG_GROUP" --region "$REGION" \
     --query 'logGroups[0].logGroupName' --output text; then
-  run aws logs delete-log-group --log-group-name "$LAMBDA_LOG_GROUP" --region "$REGION"
-  echo "    ✓ Log group deleted"
+  run aws logs delete-log-group --log-group-name "$LAMBDA_LOG_GROUP" --region "$REGION" || true
+  echo "    ✓ Log group deleted (or not found)"
 else
   echo "    ✓ Log group not found — skipped"
 fi
@@ -215,7 +215,7 @@ for lg in "${LOG_PREFIXES[@]}"; do
   if check aws logs describe-log-groups \
       --log-group-name-prefix "$lg" --region "$REGION" \
       --query 'logGroups[0].logGroupName' --output text; then
-    run aws logs delete-log-group --log-group-name "$lg" --region "$REGION"
+    run aws logs delete-log-group --log-group-name "$lg" --region "$REGION" || true
     echo "    ✓ Deleted: $lg"
   else
     echo "    ✓ Not found: $lg — skipped"

@@ -159,19 +159,15 @@ spec:
       priorityClassName: infrastructure
 
 ---
-# Cross-namespace: MCP gateway needs to read pods/logs/events in otel-demo
-# (mcp-server-kubernetes uses the SA token to query the K8s API)
+# Cluster-scoped read across all namespaces — replaces the per-namespace binding
+# into otel-demo so the gateway works even before the demo workload is deployed.
 apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+kind: ClusterRole
 metadata:
-  name: k8s-mcp-gateway-otel-demo-role
-  namespace: otel-demo
+  name: k8s-mcp-gateway-cluster-reader
 rules:
 - apiGroups: [""]
-  resources: ["pods", "pods/log"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: [""]
-  resources: ["events"]
+  resources: ["pods", "pods/log", "events", "namespaces"]
   verbs: ["get", "list", "watch"]
 - apiGroups: ["apps"]
   resources: ["deployments", "replicasets"]
@@ -182,17 +178,16 @@ rules:
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
-  name: k8s-mcp-gateway-otel-demo-binding
-  namespace: otel-demo
+  name: k8s-mcp-gateway-cluster-reader-binding
 subjects:
 - kind: ServiceAccount
   name: k8s-mcp-gateway
   namespace: k8s-agent
 roleRef:
-  kind: Role
-  name: k8s-mcp-gateway-otel-demo-role
+  kind: ClusterRole
+  name: k8s-mcp-gateway-cluster-reader
   apiGroup: rbac.authorization.k8s.io
 
 ---

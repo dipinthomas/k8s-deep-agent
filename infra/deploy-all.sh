@@ -1,16 +1,16 @@
 #!/bin/bash
-# One-command full stack deploy for the K8s AI Agent demo.
+# One-command deploy for the K8s AI Agent stack (no demo workload).
 #
 # Deploys in order:
 #   1. EKS cluster (Auto Mode, K8s 1.33) + CloudWatch Container Insights config
-#   2. OTel Demo app (Helm chart v0.40.7) with X-Ray trace export
-#   3. PriorityClasses patched onto pods
-#   4. AI agent (IRSA + K8s deployment + secrets)
-#   5. Alert pipeline (CloudWatch disk alarm → SNS → Lambda → Agent /trigger)
+#   2. Redis (for agent checkpoint + investigation state)
+#   3. AI agent (IRSA + K8s deployment + secrets)
+#   4. Alert pipeline (CloudWatch disk alarm → SNS → Lambda → Agent /trigger)
 #
-# Demo scenario: trigger-disk-pressure.sh fills the node disk → alarm fires →
-# agent investigates → finds imageprovider nginx culprit → asks for approval →
-# evicts pods → disk and checkout latency recover.
+# The OTel demo workload is NOT installed by this script. Deploy it separately
+# only when needed for the on-stage demo:
+#   bash otel-demo/deploy.sh
+#   bash infra/patch-priority-classes.sh
 #
 # Prerequisites:
 #   - eksctl, kubectl, helm, aws CLI, zip installed
@@ -26,7 +26,7 @@ set -euo pipefail
 export AWS_PROFILE="${AWS_PROFILE:-fernhub}"
 REGION="ap-southeast-2"
 CLUSTER="otel-demo-prod"
-NAMESPACE="otel-demo"
+AGENT_NAMESPACE="k8s-agent"
 ACCOUNT_ID="637039075925"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -65,7 +65,7 @@ fi
 ok "Slack webhook URL loaded"
 
 # ── Step 1: EKS Cluster + Container Insights ───────────────────────────────────
-step "Step 1/5 — EKS Cluster + CloudWatch Container Insights"
+step "Step 1/4 — EKS Cluster + CloudWatch Container Insights"
 
 # Guard: if a previous eksctl CloudFormation stack is still being deleted, wait for it.
 CF_STACK="eksctl-${CLUSTER}-cluster"
@@ -106,42 +106,26 @@ kubectl apply -f "$SCRIPT_DIR/cloudwatch-agent.yaml" \
   || warn "cloudwatch-agent.yaml apply failed — disk metrics may lag; check addon is installed"
 ok "Container Insights config applied"
 
-# ── Step 2: OTel Demo App ──────────────────────────────────────────────────────
-step "Step 2/5 — OTel Demo App"
+# ── Step 2: Redis Memory Store ────────────────────────────────────────────────
+step "Step 2/4 — Redis memory store (agent namespace)"
 
-echo "    Deploying OTel Demo via Helm (10-15 min)..."
-bash "$REPO_ROOT/otel-demo/deploy.sh" \
-  || die "OTel demo deployment failed"
-ok "OTel demo deployed (traces → Jaeger + X-Ray)"
+# Cluster-scoped PriorityClasses — required by the agent and MCP gateway pods
+# (both reference priorityClassName: infrastructure). Applied here so they exist
+# before any workload that depends on them, regardless of OTel demo presence.
+kubectl apply -f "$SCRIPT_DIR/priority-classes.yaml" \
+  || die "Failed to apply priority classes"
+ok "Priority classes applied"
 
-# ── Step 3: PriorityClasses ────────────────────────────────────────────────────
-step "Step 3/5 — PriorityClasses"
-
-bash "$SCRIPT_DIR/patch-priority-classes.sh" \
-  || die "Priority class patching failed"
-
-echo "    Restarting deployments to apply priority classes..."
-for deploy in checkout payment cart frontend frontend-proxy product-catalog \
-              image-provider load-generator ad recommendation; do
-  kubectl rollout restart deployment/"$deploy" -n "$NAMESPACE" 2>/dev/null || true
-done
-
-echo "    Waiting for rollouts to stabilise..."
-kubectl rollout status deployment/checkout -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
-kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
-ok "PriorityClasses applied and pods restarted"
-
-# ── Step 3b: Redis Memory Store ───────────────────────────────────────────────
-step "Step 3b/5 — Redis memory store"
-
+# Ensure the agent namespace exists before applying Redis (which lives in it).
+kubectl create namespace "$AGENT_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f "$SCRIPT_DIR/redis-deployment.yaml" \
   || die "Failed to apply Redis deployment"
-kubectl rollout status deployment/agent-redis -n "$NAMESPACE" --timeout=60s \
+kubectl rollout status deployment/agent-redis -n "$AGENT_NAMESPACE" --timeout=120s \
   || die "Redis pod failed to start"
-ok "Redis running"
+ok "Redis running in $AGENT_NAMESPACE"
 
-# ── Step 4: AI Agent ───────────────────────────────────────────────────────────
-step "Step 4/5 — AI Agent"
+# ── Step 3: AI Agent ───────────────────────────────────────────────────────────
+step "Step 3/4 — AI Agent"
 
 # ── IRSA: IAM Role for Service Account ────────────────────────────────────────
 # Grants the agent pod AWS credentials (CloudWatch + X-Ray) without any secrets.
@@ -188,7 +172,7 @@ else
   ok "IAM policy '$POLICY_NAME' created"
 fi
 
-TRUST_POLICY="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\"${OIDC_PROVIDER}:sub\":\"system:serviceaccount:otel-demo:k8s-agent\",\"${OIDC_PROVIDER}:aud\":\"sts.amazonaws.com\"}}}]}"
+TRUST_POLICY="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Federated\":\"arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_PROVIDER}\"},\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\"${OIDC_PROVIDER}:sub\":\"system:serviceaccount:${AGENT_NAMESPACE}:k8s-agent\",\"${OIDC_PROVIDER}:aud\":\"sts.amazonaws.com\"}}}]}"
 
 if aws iam get-role --role-name "$ROLE_NAME" &>/dev/null 2>&1; then
   warn "IAM role '$ROLE_NAME' already exists — skipping"
@@ -209,29 +193,28 @@ echo "    Deploying agent..."
 kubectl apply -f "$SCRIPT_DIR/agent-deployment.yaml" \
   || die "Failed to apply agent deployment"
 
-echo "    Waiting for agent pod to be Running..."
-kubectl rollout status deployment/k8s-agent -n "$NAMESPACE" --timeout=120s \
-  || die "Agent pod failed to start — check: kubectl logs -n $NAMESPACE deployment/k8s-agent"
-ok "Agent deployed and running"
+# Note: don't wait on rollout here — the agent and the MCP gateway are codeployed
+# and the agent's startupProbe will block until MCP sidecars are reachable. Apply
+# both, then wait at the end.
+ok "Agent manifests applied"
 
-# ── Step 4b: MCP Gateway ───────────────────────────────────────────────────────
-step "Step 4b/5 — MCP Gateway"
+# ── Step 3b: MCP Gateway ───────────────────────────────────────────────────────
+step "Step 3b/4 — MCP Gateway"
 
 kubectl apply -f "$SCRIPT_DIR/mcp-gateway-deployment.yaml" \
   || die "Failed to apply MCP gateway deployment"
-kubectl rollout status deployment/k8s-mcp-gateway -n "$NAMESPACE" --timeout=120s \
-  || die "MCP gateway pod failed to start — check: kubectl logs -n $NAMESPACE deployment/k8s-mcp-gateway"
+kubectl rollout status deployment/k8s-mcp-gateway -n "$AGENT_NAMESPACE" --timeout=180s \
+  || die "MCP gateway pod failed to start — check: kubectl logs -n $AGENT_NAMESPACE deployment/k8s-mcp-gateway"
 ok "MCP gateway running"
 
-# ── Step 5: Alert Pipeline ─────────────────────────────────────────────────────
+echo "    Waiting for agent pod to become Ready..."
+kubectl rollout status deployment/k8s-agent -n "$AGENT_NAMESPACE" --timeout=300s \
+  || die "Agent pod failed to start — check: kubectl logs -n $AGENT_NAMESPACE deployment/k8s-agent"
+ok "Agent deployed and running"
+
+# ── Step 4: Alert Pipeline ─────────────────────────────────────────────────────
 # CloudWatch disk alarm → SNS → Lambda → Agent /trigger
-#
-# Alarm:   node_filesystem_utilization > 75% for 2 consecutive minutes
-# Trigger: trigger-disk-pressure.sh fills node to ~78% — alarm fires within 2 min.
-#
-# The Lambda calls the agent's LoadBalancer /trigger endpoint directly.
-# The agent posts the opening Slack message and all investigation updates itself.
-step "Step 5/5 — Alert Pipeline (disk alarm → SNS → Lambda → Agent)"
+step "Step 4/4 — Alert Pipeline (disk alarm → SNS → Lambda → Agent)"
 
 SNS_TOPIC_NAME="eks-disk-pressure-alerts"
 LAMBDA_NAME="eks-alarm-to-agent"
@@ -243,7 +226,7 @@ DISK_THRESHOLD=75
 echo "    Detecting agent LoadBalancer URL..."
 AGENT_HOST=""
 for i in $(seq 1 12); do
-  AGENT_HOST=$(kubectl get svc k8s-agent -n "$NAMESPACE" \
+  AGENT_HOST=$(kubectl get svc k8s-agent -n "$AGENT_NAMESPACE" \
     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
   [[ -n "$AGENT_HOST" ]] && break
   warn "LoadBalancer not ready yet — waiting 10s (attempt $i/12)..."
@@ -407,26 +390,20 @@ echo -e "${GREEN}  ✅ Full stack deployed successfully!                  ${NC}"
 echo -e "${GREEN}════════════════════════════════════════════════════════${NC}"
 echo ""
 
-FRONTEND=$(kubectl get svc otel-demo-frontendproxy -n "$NAMESPACE" \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "still provisioning")
-
 echo "  Cluster:      $CLUSTER ($REGION)"
-echo "  OTel Demo:    http://$FRONTEND"
-echo "  Agent logs:   kubectl logs -n $NAMESPACE deployment/k8s-agent -f"
+echo "  Agent logs:   kubectl logs -n $AGENT_NAMESPACE deployment/k8s-agent -f"
 echo "  Alarm:        $ALARM_NAME (fires at ${DISK_THRESHOLD}% disk)"
 echo "  Pipeline:     CloudWatch → SNS → $LAMBDA_NAME → $AGENT_TRIGGER_URL"
 echo ""
-echo "  ── To run the demo ──────────────────────────────────────────"
+echo "  ── To deploy the OTel demo workload (only when needed) ──────"
+echo "  bash otel-demo/deploy.sh"
+echo "  bash infra/patch-priority-classes.sh"
+echo ""
+echo "  ── To run the demo (requires OTel demo deployed) ────────────"
 echo "  bash fault-injection/trigger-disk-pressure.sh"
-echo "    CloudWatch alarm fires in ~2 min."
-echo "    Agent investigation appears in #k8s-alerts on Slack."
-echo "    Click APPROVE to evict pods and resolve the incident."
 echo ""
 echo "  ── To test the pipeline without real disk pressure ──────────"
 echo "  bash infra/test-alert-pipeline.sh"
-echo ""
-echo "  ── To reset after the demo ──────────────────────────────────"
-echo "  bash fault-injection/reset-cluster.sh"
 echo ""
 echo "  ── To tear everything down ──────────────────────────────────"
 echo "  AWS_PROFILE=${AWS_PROFILE} bash infra/destroy.sh"
