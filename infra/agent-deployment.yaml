@@ -95,7 +95,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v16
+        image: dipinthomas2003/k8s-deep-agent:v29
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -129,18 +129,26 @@ spec:
         ports:
         - containerPort: 8080
           name: http-trigger
+        # Startup probe: wait up to ~150s for MCP sidecars + agent bootstrap before
+        # liveness kicks in. Without this, the kubelet would kill the pod mid-boot.
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 5
+          failureThreshold: 30
         livenessProbe:
           httpGet:
             path: /healthz
             port: 8080
-          initialDelaySeconds: 15
           periodSeconds: 30
+          failureThreshold: 5
         resources:
           requests:
-            memory: "256Mi"
+            memory: "1Gi"
             cpu: "250m"
           limits:
-            memory: "512Mi"
+            memory: "1Gi"
             cpu: "500m"
 
       # ── MCP sidecars ──────────────────────────────────────────────────────────
@@ -232,38 +240,8 @@ spec:
       targetPort: 8080
       name: http-trigger
 
----
-# Cross-namespace: agent needs to read/evict pods in otel-demo (where the workloads run)
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: k8s-agent-otel-demo-role
-  namespace: otel-demo
-rules:
-- apiGroups: [""]
-  resources: ["pods", "pods/log", "pods/exec"]
-  verbs: ["get", "list", "watch", "delete", "create"]
-- apiGroups: [""]
-  resources: ["events"]
-  verbs: ["get", "list", "watch"]
-- apiGroups: ["apps"]
-  resources: ["deployments", "replicasets"]
-  verbs: ["get", "list", "watch", "patch"]
-- apiGroups: ["metrics.k8s.io"]
-  resources: ["pods"]
-  verbs: ["get", "list"]
-
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: k8s-agent-otel-demo-binding
-  namespace: otel-demo
-subjects:
-- kind: ServiceAccount
-  name: k8s-agent
-  namespace: k8s-agent
-roleRef:
-  kind: Role
-  name: k8s-agent-otel-demo-role
-  apiGroup: rbac.authorization.k8s.io
+# Cross-namespace access into otel-demo is already granted by the cluster-wide
+# ClusterRoleBinding above (apiGroups/resources/verbs all *). Per-namespace
+# bindings would only add value if we tightened cluster scope; for now the
+# cluster-admin binding is sufficient and avoids a hard dependency on the
+# otel-demo namespace existing at agent deploy time.

@@ -3,6 +3,10 @@ Deep Agent setup for the K8s incident investigation agent.
 
 kubectl and CloudWatch tools come from MCP servers (mcp_client.py).
 Slack tools are Python-native to support the custom approval Block Kit UI.
+
+build_agent_async() MUST be awaited from within the persistent event loop
+(main.py's _agent_loop). This ensures MCP tool HTTP sessions are bound to
+that loop and remain valid for every subsequent agent.astream() call.
 """
 
 import logging
@@ -14,16 +18,50 @@ from langgraph.checkpoint.memory import MemorySaver
 from subagents import build_subagents
 from tools.slack_tools import post_to_slack, post_approval_request
 from memory.store import build_memory_store, seed_memory_store
-from mcp_servers.mcp_client import get_mcp_tools
+from mcp_servers.mcp_client import get_mcp_tools_async
+
+
+async def _build_checkpointer():
+    """
+    Build a persistent Redis-backed checkpointer so paused interrupts survive
+    a pod restart. Falls back to in-memory if Redis is unavailable — the agent
+    still runs, but a restart will lose any in-flight investigation state.
+    """
+    redis_url = os.environ.get("REDIS_URL")
+    if not redis_url:
+        logger.warning("REDIS_URL not set — using in-memory checkpointer (no restart survival)")
+        return MemorySaver()
+    try:
+        from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+        # from_conn_string may return either an async context manager or the
+        # checkpointer directly, depending on the package version. Handle both.
+        result = AsyncRedisSaver.from_conn_string(redis_url)
+        if hasattr(result, "__aenter__"):
+            checkpointer = await result.__aenter__()
+        else:
+            checkpointer = result
+        await checkpointer.asetup()
+        logger.info("Using AsyncRedisSaver checkpointer at %s", redis_url)
+        return checkpointer
+    except Exception as e:
+        logger.exception("Failed to build Redis checkpointer (%s) — falling back to in-memory", e)
+        return MemorySaver()
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
 You are an autonomous Kubernetes operations agent.
 
+Cluster context:
+- AGENTS.md and the cluster-specific SKILL.md are already loaded into your
+  long-term memory at startup. Refer to them directly — DO NOT call read_file
+  for "AGENTS.md", "/AGENTS.md", or any cluster skill path. They are not on
+  disk in your working directory.
+- The skills/ directory IS available via read_file for additional playbooks
+  (e.g. read_file("./skills/universal/...")).
+
 Before every investigation:
-- Read AGENTS.md to understand this cluster — its services, priorities, and rules.
-- Select the skill that matches the incident type. Skills contain investigation playbooks.
+- Select the skill from your loaded memory that matches the incident type.
 - Use whatever tools are available to gather evidence. Do not assume which tools exist —
   discover them and use the ones that answer the question.
 
@@ -42,18 +80,52 @@ Namespace discovery — mandatory before any kubectl query:
   you are looking for.
 
 Concluding every investigation — MANDATORY, no exceptions:
-After you have gathered evidence (todos show completed), you MUST:
-1. Call post_to_slack with a full findings summary: root cause, evidence, affected services,
-   recommended action, and estimated impact. Do NOT skip this step.
+The user CANNOT see your reasoning or your tool outputs — they only see what you
+explicitly send via post_to_slack and post_approval_request. A turn that ends
+with a plain text response is INVISIBLE to the user — it does not deliver value.
+
+How approval actually works (read carefully — this is the most common bug):
+post_approval_request is just a Slack post — it posts the buttons but does NOT
+pause anything. The graph only pauses when you actually CALL one of the gated
+destructive tools (kubectl_delete, kubectl_apply, kubectl_patch, kubectl_drain,
+kubectl_evict, kubectl_scale, kubectl_create, kubectl_replace, kubectl_rollout,
+kubectl_restart, kubectl_update, etc.). Calling that tool is what arms the
+human-in-the-loop gate. If you end your turn after post_approval_request
+without calling the destructive tool, the APPROVE/DENY buttons will be
+no-ops — there is nothing for them to resume.
+
+After you have gathered evidence (todos show completed), you MUST in a SINGLE
+turn:
+1. Call post_to_slack with a full findings summary: root cause, evidence, affected
+   services, recommended action, and estimated impact. (You do not pass thread_ts
+   or channel — they are injected automatically. Just write the message.)
 2. Call post_approval_request to present the approve/deny buttons to the human.
-3. Wait for the human response before taking any destructive action.
-Completing your todos is NOT the end. The investigation is only done when you have
-posted findings to Slack and received a human decision. If you have nothing to act on,
-post a "No action required" summary anyway.
+3. IMMEDIATELY in the same turn, call the recommended destructive kubectl tool
+   with the EXACT args you described in the approval request's action_list.
+   Do not emit a final text message before this call. Do not wait for an
+   "Approved" message — calling the tool is what creates the pending interrupt.
+   The graph will pause automatically at this tool call until the human clicks
+   APPROVE or DENY.
+
+After the resume (you do NOT need to do anything special to detect this — it
+just happens transparently when execution continues):
+- If APPROVED: the gated tool has ALREADY executed and you can see its result
+  in your context. Do NOT call it again. Post the outcome to Slack with
+  post_to_slack, mark todos complete, write the resolution to long-term memory.
+- If DENIED: the gated tool was skipped. Post a stand-down message via
+  post_to_slack acknowledging the denial. Do not retry. Do not propose a new
+  action without new evidence. Mark todos appropriately and end the turn.
+
+If you have nothing to act on, still call post_to_slack with a "No action required"
+summary so the user knows the investigation completed. In that case, do NOT
+call post_approval_request and do NOT call any destructive tool.
 
 Non-negotiable rules:
-- ALWAYS ask for human approval before any action that modifies cluster state.
-- ALWAYS post evidence to Slack before asking for approval.
+- ALWAYS post evidence to Slack and post_approval_request BEFORE calling a
+  destructive tool — never call a destructive tool without first showing the
+  human the evidence and the approve/deny UI.
+- ALWAYS call the destructive tool in the SAME turn as post_approval_request.
+  Posting the approval UI without queuing the gated tool is the bug to avoid.
 - ALWAYS write the outcome to long-term memory after resolution.
 - NEVER guess. If you are unsure, ask.
 """
@@ -144,25 +216,71 @@ def _wrap_with_error_handling(tool):
 
 CLUSTER_SKILL_PATH = os.environ.get("CLUSTER_SKILL_PATH", "")
 
+# Per-call hard cap on LLM HTTP requests. Without this the OpenAI / Anthropic
+# SDKs default to a multi-minute timeout, so a stalled stream pins the worker
+# thread for ~10 minutes before any retry kicks in. 90s is generous for a single
+# investigation step; bump via LLM_TIMEOUT_SEC if a step legitimately needs more.
+_LLM_TIMEOUT_SEC = float(os.environ.get("LLM_TIMEOUT_SEC", "90"))
+_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
 
-def build_agent():
-    checkpointer = MemorySaver()
+
+def _build_model_with_timeout(model_spec: str):
+    """Construct the chat model with explicit timeout + retry. Accepts the same
+    `provider:model` shorthand deepagents normally accepts as a bare string."""
+    if ":" not in model_spec:
+        # Unknown shape — let deepagents handle it; we lose the timeout but the
+        # agent still runs. Log loudly so it's discoverable.
+        logger.warning(
+            "AGENT_MODEL=%r has no provider prefix — passing through without "
+            "timeout/retry config. Use 'openai:gpt-5-mini' or 'anthropic:claude-...'.",
+            model_spec,
+        )
+        return model_spec
+
+    provider, model_name = model_spec.split(":", 1)
+    if provider == "openai":
+        from langchain_openai import ChatOpenAI
+        # use_responses_api=True routes to POST /responses (the modern endpoint)
+        # instead of /chat/completions. /responses returns reasoning blocks
+        # attached to each AIMessage, which the graph then carries forward as
+        # message content — keeping the prefix cache hot and avoiding the
+        # "regenerate reasoning from scratch every turn" cost we hit on
+        # /chat/completions. NOT setting use_previous_response_id (which would
+        # also drop history from the payload) — that interacts badly with
+        # langgraph interrupt resume.
+        return ChatOpenAI(
+            model=model_name,
+            use_responses_api=True,
+            timeout=_LLM_TIMEOUT_SEC,
+            max_retries=_LLM_MAX_RETRIES,
+        )
+    if provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(
+            model=model_name,
+            timeout=_LLM_TIMEOUT_SEC,
+            max_retries=_LLM_MAX_RETRIES,
+        )
+    logger.warning(
+        "AGENT_MODEL provider %r not in [openai, anthropic] — passing through "
+        "as bare string (no timeout/retry).", provider,
+    )
+    return model_spec
+
+
+async def build_agent_async():
+    """
+    Build and return the agent. Must be awaited from within the persistent
+    event loop so that MCP tool HTTP sessions are bound to that loop.
+    """
+    checkpointer = await _build_checkpointer()
     store = build_memory_store()
     seed_memory_store(store)
 
-    # Load MCP tools from gateway pod (blocking — fetches tool schemas once at startup).
-    # Wrap each tool so MCP errors are returned as strings rather than crashing the graph.
-    mcp_tools = [_wrap_with_error_handling(t) for t in get_mcp_tools()]
+    # Load MCP tools inside the persistent loop — sessions remain valid.
+    raw_tools = await get_mcp_tools_async()
+    mcp_tools = [_wrap_with_error_handling(t) for t in raw_tools]
 
-    # Human-in-the-loop sequence (must always happen in this order):
-    #   1. Agent calls post_approval_request → posts evidence + buttons to Slack
-    #   2. Agent calls a destructive tool → interrupt_on fires → graph pauses
-    #   3. Slack button click → handle_approve/deny in main.py → graph resumes
-    #
-    # interrupt_on is the guarantee. post_approval_request is the UI.
-    # If interrupt_on doesn't gate a tool, the action executes without approval
-    # even if post_approval_request was called. That's why dynamic derivation
-    # is critical — hardcoded tool names may silently miss tools.
     interrupt_on = _build_interrupt_on(mcp_tools)
     logger.info(
         "interrupt_on derived from MCP tools (%d tools gated): %s",
@@ -178,7 +296,9 @@ def build_agent():
             "Set this env var to the path of the cluster SKILL.md for this deployment."
         )
 
-    model = os.environ.get("AGENT_MODEL", "anthropic:claude-sonnet-4-6")
+    model = _build_model_with_timeout(
+        os.environ.get("AGENT_MODEL", "anthropic:claude-sonnet-4-6")
+    )
 
     agent = create_deep_agent(
         model=model,
@@ -200,3 +320,9 @@ def build_agent():
     )
 
     return agent
+
+
+def build_agent():
+    """Synchronous shim for backwards compatibility. Prefer build_agent_async()."""
+    import asyncio
+    return asyncio.run(build_agent_async())
