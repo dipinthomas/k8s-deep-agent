@@ -512,6 +512,98 @@ echo "✅ Cluster reset complete"
 
 ---
 
+## 6f. Agent Loop Control — `KeepLoopingMiddleware` (v30+)
+
+The agent uses Deep Agents' middleware hook to force a true plan→act→observe
+loop instead of exiting after the first model turn that returns empty
+`tool_calls`. Without this, gpt-5-mini regularly stops on three failure
+patterns:
+
+1. **Natural end** — model emits an `AIMessage` with no tool calls because it
+   thinks the summary it just wrote is "the answer". LangGraph exits.
+2. **Tool error stand-down** — a destructive call fails (e.g. `node_management`
+   drain failing because of `emptyDir` or DaemonSet pods). The model posts a
+   summary instead of re-planning with corrective flags or switching tools.
+3. **Gate never armed** — the model calls `post_approval_request` but does
+   NOT queue the destructive tool in the same turn, so the HITL `interrupt_on`
+   has nothing to pause on. Buttons are no-ops.
+
+### What it does
+
+[agent/middleware.py](agent/middleware.py) defines `KeepLoopingMiddleware`,
+hooked via `after_model` / `aafter_model`. It runs after each model response
+and BEFORE `HumanInTheLoopMiddleware`, so a correctly queued destructive tool
+still arms the gate normally.
+
+State schema is extended with `explicit_stand_down: bool` so the flag persists
+across turns via the Redis checkpointer.
+
+| Detected condition                                                | Action                                                             |
+|-------------------------------------------------------------------|--------------------------------------------------------------------|
+| `AIMessage` with empty `tool_calls`, no stand-down phrase in text | Inject corrective `HumanMessage` listing the three valid options    |
+| `AIMessage` content contains "no action required" / "standing down" / "investigation complete" | Set `explicit_stand_down=True` (graph allowed to exit)              |
+| `mark_stand_down` tool was called this turn                       | Set `explicit_stand_down=True`                                     |
+| `post_approval_request` called WITHOUT a destructive tool in same turn | Inject corrective `HumanMessage` so the model re-issues both calls |
+| `post_approval_request` only, but a destructive tool just succeeded (mid-loop after APPROVE) | No action — legitimate state                                       |
+
+### The three valid termination paths
+
+The graph keeps looping until ONE of these happens:
+
+1. The agent calls a destructive kubectl tool — HITL pauses the graph.
+2. The agent posts a stand-down summary via `post_to_slack` containing a
+   recognised phrase ("no action required", "standing down", "investigation
+   complete"), then `mark_stand_down` on the next turn.
+3. The agent calls `mark_stand_down` directly with a brief reason.
+
+### `mark_stand_down` tool
+
+[agent/agent.py](agent/agent.py) defines `mark_stand_down(reason: str)`. The
+agent calls it when the incident is fully resolved, the user denied the
+recommended action, or no remediation is appropriate. The middleware
+recognises the call and sets `explicit_stand_down=True`, allowing the graph
+to exit cleanly on the next turn.
+
+### Re-plan-on-error rule
+
+The system prompt (and `AGENTS.md`, `skills/universal/node-disk-pressure/
+SKILL.md`) instruct the agent: if a destructive tool returns `Tool error: ...`
+after approval, do NOT post a final summary. Re-plan — retry with corrective
+flags (`--force --delete-emptydir-data --ignore-daemonsets` for drain) or
+switch tools (`kubectl_delete pod` per non-critical pod), then re-run the
+approval gate.
+
+### Preferred remediation: `kubectl_delete pod` over drain
+
+For this demo cluster, the playbooks prefer
+`kubectl_delete pod <name> -n <namespace>` issued for each non-critical pod
+in priority order, NOT a node-wide drain. The cluster contains bare pods,
+DaemonSets, and `emptyDir` volumes that make drain fail with unfixable
+obstacles. Targeted pod delete succeeds reliably and gives finer-grained
+control. See [skills/universal/node-disk-pressure/SKILL.md](skills/universal/node-disk-pressure/SKILL.md)
+Step 9.
+
+### Multi-arch image
+
+[agent/Dockerfile](agent/Dockerfile) now uses `ARG TARGETARCH` for the
+`kubectl` download URL so `docker buildx build --platform linux/amd64,linux/arm64`
+produces a working image on both architectures. Previously the URL was
+hardcoded to `amd64`, which silently produced a broken arm64 image.
+
+Build & push (versioned tag, multi-arch — both rules from CLAUDE memory):
+```bash
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  --builder multiarch-builder \
+  -t dipinthomas2003/k8s-deep-agent:v30 \
+  -f agent/Dockerfile \
+  --push .
+
+AWS_PROFILE=fernhub kubectl apply -f infra/agent-deployment.yaml
+```
+
+---
+
 ## 7. DEPLOYMENT STEPS
 
 ### Step 1 — EKS Cluster

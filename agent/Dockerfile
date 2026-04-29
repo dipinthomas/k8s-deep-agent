@@ -7,7 +7,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── kubectl (for fallback / troubleshooting) ───────────────────────────────────
-RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" \
+# TARGETARCH is set automatically by buildx for each platform in the matrix
+# (amd64, arm64, etc). Without this the kubectl download is hardcoded to amd64
+# and produces a broken arm64 image that segfaults at runtime.
+ARG TARGETARCH
+RUN curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" \
     && chmod +x kubectl && mv kubectl /usr/local/bin/
 
 # ── Python application deps ────────────────────────────────────────────────────

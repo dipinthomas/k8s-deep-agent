@@ -60,3 +60,33 @@ configured via `SLACK_CHANNEL_ID`. Tag the on-call contact configured via
   that shows the anomaly.
 - If a tool call fails or returns no data, try an alternative approach — do not halt.
 - Report what is healthy as well as what is not. Absence of a signal is evidence too.
+
+## Remediation Preferences
+
+When proposing a remediation:
+
+- **Prefer targeted `kubectl_delete pod <name> -n <namespace>`** over node-level
+  operations like `node_management` drain or cordon. The demo cluster contains
+  bare pods, DaemonSets, and emptyDir volumes that cause drain to fail with
+  unfixable obstacles ("cannot evict pod ... has emptyDir", "DaemonSet-managed").
+  Deleting individual non-critical pods is simpler, succeeds reliably, and gives
+  finer-grained control over which workloads are sacrificed.
+- Build the action list as a sequence of `kubectl_delete pod` calls (lowest
+  priority first), not as one big drain.
+- Reserve drain/cordon for genuine node-level failures (hardware faults, node
+  taints applied) — not routine resource pressure.
+
+## Re-Plan on Tool Error
+
+If a destructive tool returns an error after approval (e.g. drain fails because
+of emptyDir, eviction fails because the pod has no controller), do NOT post a
+final summary and stop. Re-plan:
+
+1. Read the error and identify what would have made it succeed.
+2. Either retry with corrective flags (`--force --delete-emptydir-data
+   --ignore-daemonsets` for drain), or switch to a different tool
+   (`kubectl_delete pod <name>` for each non-critical pod individually).
+3. Re-run the approval gate: post_to_slack with the new plan +
+   post_approval_request + the new destructive tool call, all in the same turn.
+
+Standing down on the first error wastes the incident.

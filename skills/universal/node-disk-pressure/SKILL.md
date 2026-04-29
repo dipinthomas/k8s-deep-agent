@@ -75,3 +75,54 @@ Use `post_approval_request` tool with:
 - Ranked eviction list with estimated impact per pod
 - Statement that payment services are protected
 - @dipin tag for approval
+
+### Step 9 — Choose the remediation tool: PREFER `kubectl_delete pod`
+
+For disk pressure on this cluster, the recommended remediation is
+`kubectl_delete pod <name> -n <namespace>` issued for each non-critical pod
+in priority order — NOT a node-wide drain.
+
+Why pod delete over drain:
+- The demo cluster contains bare pods (no controller), DaemonSets, and
+  emptyDir volumes. `kubectl drain` / `node_management` fails on all three
+  by default with errors like:
+    - `cannot delete Pods that declare no controller`
+    - `cannot delete Pods with local storage (emptyDir)`
+    - `cannot delete DaemonSet-managed Pods`
+  Forcing through these (`--force --delete-emptydir-data --ignore-daemonsets`)
+  is risky and noisy.
+- Pod deletion is targeted: you control exactly which workloads are sacrificed
+  in priority order, payment services are simply never on the list, and the
+  controller (Deployment / StatefulSet) reschedules them automatically when
+  capacity is available.
+- Pod deletion succeeds reliably without special flags.
+
+In the SAME turn as `post_approval_request`, queue ONE `kubectl_delete` per
+target pod. The HITL gate will bundle them into a single approval; the human
+clicks APPROVE once and all queued deletes execute.
+
+Example tool calls to queue alongside the approval request (substitute your
+actual pod names from Step 3):
+```
+kubectl_delete  resource_type=pod name=loadgenerator-...    namespace=otel-demo
+kubectl_delete  resource_type=pod name=imageprovider-...    namespace=otel-demo
+kubectl_delete  resource_type=pod name=adservice-...        namespace=otel-demo
+```
+
+### Step 10 — If a delete fails, RE-PLAN (do not stand down)
+
+After the human approves, if any `kubectl_delete` call returns an error
+(`Tool error: ...` or a Kubernetes 4xx response), you MUST re-plan rather
+than summarising and stopping:
+
+- "pod not found" → the controller already rescheduled it; pick the next
+  pod in the ranked list and propose again.
+- "forbidden" / RBAC error → switch to a different pod or surface the RBAC
+  issue to the human via post_to_slack with a fresh approval request.
+- node still under disk pressure after the deletes → propose the next tier
+  of eviction candidates (e.g. add `recommendationservice` to the list).
+
+Each re-plan goes through the approval gate again: `post_to_slack` with the
+new finding + `post_approval_request` + the new destructive tool calls, all
+in one turn. Only call `mark_stand_down` once disk pressure has cleared OR
+the user has explicitly denied further action.

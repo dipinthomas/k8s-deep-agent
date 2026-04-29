@@ -13,12 +13,37 @@ import logging
 import os
 from functools import wraps
 from deepagents import create_deep_agent
+from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 
 from subagents import build_subagents
 from tools.slack_tools import post_to_slack, post_approval_request
 from memory.store import build_memory_store, seed_memory_store
 from mcp_servers.mcp_client import get_mcp_tools_async
+from middleware import KeepLoopingMiddleware
+
+
+@tool
+def mark_stand_down(reason: str) -> str:
+    """Declare that the investigation is genuinely complete or that no
+    further action is possible.
+
+    Call this ONLY when one of the following is true:
+      - The incident is fully resolved and you have already posted a
+        resolution summary to Slack.
+      - The user denied your recommended action and you have nothing
+        new to propose without fresh evidence.
+      - You have established that no remediation is appropriate (e.g.
+        the alarm was a false positive).
+
+    After this is called, the agent loop will exit on the next turn.
+    Never call this in lieu of investigating — it ends the loop.
+
+    Args:
+        reason: One short sentence on why you are standing down. This is
+            recorded in the agent's state for later debugging.
+    """
+    return f"Stand-down recorded: {reason}"
 
 
 async def _build_checkpointer():
@@ -110,15 +135,57 @@ turn:
 After the resume (you do NOT need to do anything special to detect this — it
 just happens transparently when execution continues):
 - If APPROVED: the gated tool has ALREADY executed and you can see its result
-  in your context. Do NOT call it again. Post the outcome to Slack with
-  post_to_slack, mark todos complete, write the resolution to long-term memory.
+  in your context.
+  * On SUCCESS: do NOT call the same tool again. Post the outcome to Slack
+    with post_to_slack, mark todos complete, write the resolution to long-term
+    memory, then call mark_stand_down to end the loop.
+  * On ERROR (the tool returned a "Tool error: ..." string): you MUST re-plan,
+    not summarise. Read the error carefully and decide:
+      - Retry with corrective flags. Example: a `node_management` drain that
+        fails with "cannot evict pod ... DaemonSet-managed" or "has emptyDir"
+        should be retried with `--force --delete-emptydir-data --ignore-daemonsets`.
+      - Switch to a different tool. Example: if drain repeatedly fails,
+        switch to `kubectl_delete pod <name> -n <namespace>` for each
+        non-critical pod individually — that is the preferred remediation
+        for disk pressure on this cluster anyway (see SKILL.md).
+    Whichever path you pick, you MUST go through the approval gate again:
+    post_to_slack with the new finding + post_approval_request + the new
+    destructive tool call, all in the same turn.
 - If DENIED: the gated tool was skipped. Post a stand-down message via
-  post_to_slack acknowledging the denial. Do not retry. Do not propose a new
-  action without new evidence. Mark todos appropriately and end the turn.
+  post_to_slack acknowledging the denial, then call mark_stand_down. Do not
+  retry. Do not propose a new action without new evidence.
 
 If you have nothing to act on, still call post_to_slack with a "No action required"
-summary so the user knows the investigation completed. In that case, do NOT
-call post_approval_request and do NOT call any destructive tool.
+summary so the user knows the investigation completed, then call mark_stand_down.
+In that case, do NOT call post_approval_request and do NOT call any destructive tool.
+
+Ending the loop — IMPORTANT:
+The graph will keep looping until you do ONE of these three things:
+  1. Call a destructive kubectl tool (the HITL gate pauses the graph).
+  2. Post a stand-down summary via post_to_slack containing a phrase like
+     "no action required", "standing down", or "investigation complete",
+     AND then call mark_stand_down on the next turn.
+  3. Call mark_stand_down directly with a brief reason.
+A turn that ends with empty tool_calls and no stand-down phrase will be
+rejected and you will be asked to choose one of the three options. Do NOT
+end your turn with plain text alone — it produces no user-visible output
+and wastes a turn.
+
+Re-planning on tool error — non-negotiable:
+If ANY tool call returns an error string (starts with "Tool error:" or
+contains a Kubernetes error like "cannot evict pod ..."), do NOT post a
+final summary and stop. Re-plan: pick a different tool or retry with
+corrective flags, gather more evidence if needed, and propose a new action
+through the approval gate. Standing down on the first error wastes the
+incident — the agent's job is to converge on a working fix.
+
+Preferred remediation for disk pressure:
+For this cluster, prefer `kubectl_delete pod <name> -n <namespace>` for each
+non-critical pod over a node-wide drain. The demo cluster has bare pods,
+DaemonSets, and emptyDir volumes that make `node_management` drain fail with
+unfixable obstacles. Targeted pod deletes are simpler, faster, and more
+predictable. See skills/universal/node-disk-pressure/SKILL.md for the full
+playbook.
 
 Non-negotiable rules:
 - ALWAYS post evidence to Slack and post_approval_request BEFORE calling a
@@ -127,6 +194,7 @@ Non-negotiable rules:
 - ALWAYS call the destructive tool in the SAME turn as post_approval_request.
   Posting the approval UI without queuing the gated tool is the bug to avoid.
 - ALWAYS write the outcome to long-term memory after resolution.
+- NEVER summarise instead of re-planning when a tool fails.
 - NEVER guess. If you are unsure, ask.
 """
 
@@ -307,8 +375,10 @@ async def build_agent_async():
         tools=[
             post_to_slack,
             post_approval_request,
+            mark_stand_down,
             *mcp_tools,
         ],
+        middleware=[KeepLoopingMiddleware(set(interrupt_on.keys()))],
         checkpointer=checkpointer,
         store=store,
         interrupt_on=interrupt_on,
