@@ -1,20 +1,22 @@
 #!/bin/bash
 # Trigger the noisy-neighbor demo scenario.
 #
-# Deploys a stress pod on the same node as checkout, consuming ~80% of node CPU.
+# Deploys a stress pod on a worker node, consuming ~80% of node CPU.
 # This keeps CPU high enough to trigger the CloudWatch alarm (threshold: 75%)
 # without pegging the node to 100% — which would make kubectl unresponsive.
 #
 # The alarm fires → SNS → Lambda → agent /trigger endpoint.
 # The agent investigates: finds the stress pod, identifies it as non-critical,
-# and recommends eviction to protect checkoutservice.
+# and recommends eviction.
 #
-# Usage: bash fault-injection/trigger-noisy-neighbor.sh
-# Reset: bash fault-injection/reset-cluster.sh
+# Usage:           bash fault-injection/trigger-noisy-neighbor.sh
+# Pin to a node:   TARGET_NODE=<node-name> bash fault-injection/trigger-noisy-neighbor.sh
+# Use a namespace: NAMESPACE=<ns> bash fault-injection/trigger-noisy-neighbor.sh
+# Reset:           bash fault-injection/reset-cluster.sh
 
 set -euo pipefail
 
-NAMESPACE="otel-demo"
+NAMESPACE="${NAMESPACE:-default}"
 # Target 80% CPU utilisation — enough to alarm, low enough to stay manageable.
 # stress --cpu N pegs N threads to 100%; using 80% of vCPUs hits ~80% node CPU.
 CPU_PCT="${CPU_PCT:-80}"
@@ -22,22 +24,33 @@ CPU_PCT="${CPU_PCT:-80}"
 echo "🔴 Deploying noisy-neighbor stress pod (targeting ~${CPU_PCT}% node CPU)..."
 echo ""
 
-# ── Find checkout's node ───────────────────────────────────────────────────────
-echo "==> Finding checkout pod's node..."
-TARGET_NODE=$(kubectl get pod -n "$NAMESPACE" \
-  -l app.kubernetes.io/component=checkout \
-  -o jsonpath='{.items[0].spec.nodeName}')
+# ── Pick a target node ────────────────────────────────────────────────────────
+# If TARGET_NODE is set in the env, use it. Otherwise pick the first Ready
+# worker node (excluding control plane). EKS Auto Mode nodes are unlabelled
+# workers, so we just take the first node we find.
+if [[ -n "${TARGET_NODE:-}" ]]; then
+  echo "==> Using node from env: $TARGET_NODE"
+else
+  echo "==> Finding a Ready worker node..."
+  TARGET_NODE=$(kubectl get nodes \
+    --no-headers \
+    -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[?(@.type=="Ready")].status' \
+    | awk '$2=="True" {print $1; exit}')
+fi
 
 if [[ -z "$TARGET_NODE" ]]; then
-  echo "ERROR: Could not find checkout pod. Is the cluster running?"
+  echo "ERROR: Could not find a Ready node. Is the cluster running?"
+  echo "       Try: kubectl get nodes"
   exit 1
 fi
 
 NODE_CPU=$(kubectl get node "$TARGET_NODE" -o jsonpath='{.status.capacity.cpu}')
-# Calculate number of stress threads = floor(vCPUs * CPU_PCT / 100), minimum 1
-STRESS_WORKERS=$(python3 -c "import math; print(max(1, math.floor(${NODE_CPU} * ${CPU_PCT} / 100)))")
-echo "    Checkout node : $TARGET_NODE  (${NODE_CPU} vCPUs)"
-echo "    Stress threads: $STRESS_WORKERS  (targeting ~${CPU_PCT}% utilisation)"
+# stress-ng strategy: spawn one worker per vCPU, each running at CPU_PCT load.
+# This gives exact percentage targeting regardless of node size — unlike
+# `stress --cpu N` which only takes integer workers and can't do fractions.
+STRESS_WORKERS="$NODE_CPU"
+echo "    Target node   : $TARGET_NODE  (${NODE_CPU} vCPUs)"
+echo "    Stress threads: $STRESS_WORKERS workers @ ${CPU_PCT}% load each (~${CPU_PCT}% node CPU)"
 
 # ── Deploy stress pod on the same node ────────────────────────────────────────
 echo ""
@@ -62,13 +75,15 @@ spec:
     - operator: Exists
   containers:
     - name: stress
-      image: progrium/stress
-      args: ["--cpu", "${STRESS_WORKERS}", "--timeout", "0"]
+      image: polinux/stress-ng
+      # One worker per vCPU at CPU_PCT load each = ~CPU_PCT% node CPU.
+      # No --timeout: runs until the pod is deleted (reset script handles cleanup).
+      args: ["--cpu", "${STRESS_WORKERS}", "--cpu-load", "${CPU_PCT}"]
       resources:
         requests:
           cpu: "0"
-        limits:
-          cpu: "${STRESS_WORKERS}"
+        # No CPU limit: cgroup CFS throttling under contention prevents the
+        # pod from reaching its target % on small (2 vCPU) nodes.
 EOF
 
 kubectl apply -f /tmp/demo-stress.yaml

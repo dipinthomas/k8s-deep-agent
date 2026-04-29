@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-NAMESPACE="otel-demo"
+NAMESPACE="${NAMESPACE:-default}"
 
 echo "🟢 Resetting cluster to healthy state..."
 echo ""
@@ -47,10 +47,12 @@ for deployment in checkout payment cart image-provider ad recommendation load-ge
   fi
 done
 
-# ── Wait for checkout to recover ───────────────────────────────────────────────
-echo ""
-echo "==> Waiting for checkout to be ready..."
-kubectl rollout status deployment/checkout -n "$NAMESPACE" --timeout=120s
+# ── Wait for checkout to recover (only if the OTel demo is deployed) ──────────
+if kubectl get deployment checkout -n "$NAMESPACE" &>/dev/null; then
+  echo ""
+  echo "==> Waiting for checkout to be ready..."
+  kubectl rollout status deployment/checkout -n "$NAMESPACE" --timeout=120s
+fi
 
 echo ""
 echo "==> Current pod status:"
