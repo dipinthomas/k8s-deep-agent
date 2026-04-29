@@ -19,7 +19,7 @@
 set -euo pipefail
 
 export AWS_PROFILE="${AWS_PROFILE:-fernhub}"
-REGION="ap-southeast-2"
+REGION="us-east-1"
 CLUSTER="otel-demo-prod"
 ALARM_NAME="EKS-NodeCPUPressure-${CLUSTER}"
 SNS_TOPIC_NAME="eks-cpu-pressure-alerts"
@@ -98,29 +98,43 @@ else
   echo "    ✓ Log group not found — skipped"
 fi
 
-# ── Step 3b: Lambda VPC ENI cleanup ───────────────────────────────────────────
+# ── Step 3b: Lambda VPC ENI + Security Group cleanup ──────────────────────────
 # AWS leaves VPC-attached Lambda ENIs behind after function deletion (up to ~20 min).
-# These block subnet deletion in the eksctl CloudFormation stack. We wait for them
-# to detach and then delete them before the EKS stack teardown.
+# These block both the Lambda SG deletion and subnet deletion in the eksctl
+# CloudFormation stack. We filter ENIs by the Lambda SG itself (not by description,
+# which has changed across Lambda versions and may not include the function name),
+# wait for them to detach, delete them, then delete the SG with retry-on-dependency.
 echo ""
-echo "==> Step 3b: Cleaning up Lambda VPC ENIs for '$LAMBDA_NAME'..."
-if [[ "$DRY_RUN" != "true" ]]; then
-  MAX_WAIT=120
+echo "==> Step 3b: Cleaning up Lambda VPC ENIs and security group '$LAMBDA_SG_NAME'..."
+
+# Resolve the Lambda SG ID up-front so we can filter ENIs by it.
+LAMBDA_SG_ID=$(aws ec2 describe-security-groups \
+  --filters "Name=group-name,Values=${LAMBDA_SG_NAME}" \
+  --region "$REGION" \
+  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
+
+if [[ -z "$LAMBDA_SG_ID" || "$LAMBDA_SG_ID" == "None" ]]; then
+  echo "    ✓ Lambda security group '$LAMBDA_SG_NAME' not found — skipped"
+elif [[ "$DRY_RUN" == "true" ]]; then
+  echo "    [DRY RUN] Would clean up ENIs using $LAMBDA_SG_ID and delete the SG"
+else
+  MAX_WAIT=600   # 10 minutes — Lambda ENI detach can take up to ~20 min in worst case
   ELAPSED=0
   while true; do
+    # Filter ENIs by SG membership — robust against Lambda ENI description changes.
     ENIS=$(aws ec2 describe-network-interfaces \
-      --filters "Name=description,Values=AWS Lambda VPC ENI-${LAMBDA_NAME}" \
+      --filters "Name=group-id,Values=${LAMBDA_SG_ID}" \
       --region "$REGION" \
       --query 'NetworkInterfaces[].NetworkInterfaceId' \
       --output text 2>/dev/null || true)
 
     if [[ -z "$ENIS" ]]; then
-      echo "    ✓ No Lambda VPC ENIs found — skipped"
+      echo "    ✓ No ENIs using SG $LAMBDA_SG_ID"
       break
     fi
 
     IN_USE=$(aws ec2 describe-network-interfaces \
-      --filters "Name=description,Values=AWS Lambda VPC ENI-${LAMBDA_NAME}" \
+      --filters "Name=group-id,Values=${LAMBDA_SG_ID}" \
                 "Name=status,Values=in-use" \
       --region "$REGION" \
       --query 'NetworkInterfaces[].NetworkInterfaceId' \
@@ -128,14 +142,15 @@ if [[ "$DRY_RUN" != "true" ]]; then
 
     if [[ -z "$IN_USE" ]]; then
       for eni in $ENIS; do
-        aws ec2 delete-network-interface --network-interface-id "$eni" --region "$REGION"
-        echo "    ✓ Deleted Lambda VPC ENI: $eni"
+        aws ec2 delete-network-interface --network-interface-id "$eni" --region "$REGION" 2>/dev/null \
+          && echo "    ✓ Deleted ENI: $eni" \
+          || echo "    ⚠ Could not delete ENI $eni (may already be gone)"
       done
       break
     fi
 
     if [[ $ELAPSED -ge $MAX_WAIT ]]; then
-      echo "    ⚠ Timeout waiting for Lambda ENIs to detach — subnet deletion may fail"
+      echo "    ⚠ Timeout waiting for ENIs to detach after ${MAX_WAIT}s — continuing anyway"
       break
     fi
 
@@ -143,20 +158,37 @@ if [[ "$DRY_RUN" != "true" ]]; then
     sleep 10
     ELAPSED=$((ELAPSED + 10))
   done
-else
-  echo "    [DRY RUN] Would wait for and delete Lambda VPC ENIs matching 'AWS Lambda VPC ENI-${LAMBDA_NAME}'"
-fi
 
-# Delete the Lambda security group — also blocks VPC deletion if left behind.
-LAMBDA_SG_ID=$(aws ec2 describe-security-groups \
-  --filters "Name=group-name,Values=${LAMBDA_SG_NAME}" \
-  --region "$REGION" \
-  --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || true)
-if [[ -n "$LAMBDA_SG_ID" && "$LAMBDA_SG_ID" != "None" ]]; then
-  run aws ec2 delete-security-group --group-id "$LAMBDA_SG_ID" --region "$REGION"
-  echo "    ✓ Deleted Lambda security group: $LAMBDA_SG_ID ($LAMBDA_SG_NAME)"
-else
-  echo "    ✓ Lambda security group '$LAMBDA_SG_NAME' not found — skipped"
+  # Delete the SG with retry — AWS control plane often lags after ENI deletion,
+  # so the first delete attempt can fail with DependencyViolation even when
+  # nothing actually references the SG anymore.
+  SG_DELETED=false
+  for attempt in 1 2 3 4 5 6; do
+    if aws ec2 delete-security-group --group-id "$LAMBDA_SG_ID" --region "$REGION" 2>/tmp/sg-del-err.$$; then
+      echo "    ✓ Deleted Lambda security group: $LAMBDA_SG_ID ($LAMBDA_SG_NAME)"
+      SG_DELETED=true
+      rm -f /tmp/sg-del-err.$$
+      break
+    fi
+    ERR=$(cat /tmp/sg-del-err.$$ 2>/dev/null || true)
+    if echo "$ERR" | grep -q "InvalidGroup.NotFound"; then
+      echo "    ✓ Lambda security group already gone"
+      SG_DELETED=true
+      rm -f /tmp/sg-del-err.$$
+      break
+    fi
+    if echo "$ERR" | grep -q "DependencyViolation"; then
+      echo "    Attempt $attempt: SG still has dependency, waiting 30s and retrying..."
+      sleep 30
+      continue
+    fi
+    echo "    ⚠ Unexpected error deleting SG: $ERR"
+    break
+  done
+  rm -f /tmp/sg-del-err.$$
+  if [[ "$SG_DELETED" != "true" ]]; then
+    echo "    ⚠ Could not delete Lambda SG after retries — eksctl may handle it via VPC teardown"
+  fi
 fi
 
 # ── Step 4: Lambda IAM Role ────────────────────────────────────────────────────
@@ -222,6 +254,91 @@ for lg in "${LOG_PREFIXES[@]}"; do
   fi
 done
 
+# ── Step 6b: EKS Addons ────────────────────────────────────────────────────────
+# Addons (e.g. amazon-cloudwatch-observability) get their own CloudFormation stacks
+# when installed via eksctl. `eksctl delete cluster` does not always remove them
+# cleanly — explicitly delete addons first so the VPC/cluster teardown is clean.
+echo ""
+echo "==> Step 6b: Deleting EKS addons for cluster '$CLUSTER'..."
+if check aws eks describe-cluster --name "$CLUSTER" --region "$REGION"; then
+  ADDONS=$(aws eks list-addons --cluster-name "$CLUSTER" --region "$REGION" \
+    --query 'addons[]' --output text 2>/dev/null || true)
+  for addon in $ADDONS; do
+    [[ -z "$addon" ]] && continue
+    run aws eks delete-addon --cluster-name "$CLUSTER" --addon-name "$addon" \
+      --region "$REGION" --preserve 2>/dev/null || true
+    echo "    ✓ Requested deletion of addon: $addon"
+  done
+  if [[ "$DRY_RUN" != "true" && -n "$ADDONS" ]]; then
+    echo "    Waiting up to 5 min for addons to delete..."
+    for addon in $ADDONS; do
+      [[ -z "$addon" ]] && continue
+      WAITED=0
+      while check aws eks describe-addon --cluster-name "$CLUSTER" \
+          --addon-name "$addon" --region "$REGION"; do
+        if [[ $WAITED -ge 300 ]]; then
+          echo "    ⚠ Timeout waiting for addon $addon — continuing"
+          break
+        fi
+        sleep 10
+        WAITED=$((WAITED + 10))
+      done
+      echo "    ✓ Addon $addon removed"
+    done
+  fi
+else
+  echo "    ✓ Cluster not found — no addons to delete"
+fi
+
+# Force-delete any leftover addon CloudFormation stacks (sometimes orphaned).
+ADDON_STACKS=$(aws cloudformation list-stacks --region "$REGION" \
+  --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE DELETE_FAILED ROLLBACK_COMPLETE \
+  --query "StackSummaries[?starts_with(StackName, \`eksctl-${CLUSTER}-addon-\`)].StackName" \
+  --output text 2>/dev/null || true)
+for stack in $ADDON_STACKS; do
+  [[ -z "$stack" ]] && continue
+  echo "    Deleting orphaned addon stack: $stack"
+  run aws cloudformation delete-stack --stack-name "$stack" --region "$REGION" || true
+  if [[ "$DRY_RUN" != "true" ]]; then
+    aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION" 2>/dev/null \
+      && echo "    ✓ Deleted: $stack" \
+      || echo "    ⚠ Stack $stack did not finish deleting cleanly — eksctl may retry"
+  fi
+done
+
+# ── Step 6c: Stray Load Balancers in cluster VPC ──────────────────────────────
+# AWS Load Balancer Controller (or Service type=LoadBalancer) creates ELBs/ALBs/NLBs
+# that are NOT tracked by the eksctl CloudFormation stack. They block VPC deletion.
+echo ""
+echo "==> Step 6c: Cleaning up load balancers tagged for cluster '$CLUSTER'..."
+CLUSTER_VPC=$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" \
+  --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null || echo "")
+if [[ -n "$CLUSTER_VPC" && "$CLUSTER_VPC" != "None" ]]; then
+  # Classic ELBs
+  CLB_NAMES=$(aws elb describe-load-balancers --region "$REGION" \
+    --query "LoadBalancerDescriptions[?VPCId==\`${CLUSTER_VPC}\`].LoadBalancerName" \
+    --output text 2>/dev/null || true)
+  for lb in $CLB_NAMES; do
+    [[ -z "$lb" ]] && continue
+    run aws elb delete-load-balancer --load-balancer-name "$lb" --region "$REGION" || true
+    echo "    ✓ Deleted classic ELB: $lb"
+  done
+  # ALBs / NLBs (v2)
+  ALB_ARNS=$(aws elbv2 describe-load-balancers --region "$REGION" \
+    --query "LoadBalancers[?VpcId==\`${CLUSTER_VPC}\`].LoadBalancerArn" \
+    --output text 2>/dev/null || true)
+  for arn in $ALB_ARNS; do
+    [[ -z "$arn" ]] && continue
+    run aws elbv2 delete-load-balancer --load-balancer-arn "$arn" --region "$REGION" || true
+    echo "    ✓ Deleted ALB/NLB: $arn"
+  done
+  if [[ -z "$CLB_NAMES" && -z "$ALB_ARNS" ]]; then
+    echo "    ✓ No load balancers in VPC $CLUSTER_VPC"
+  fi
+else
+  echo "    ✓ Cluster VPC not resolvable — skipping LB cleanup"
+fi
+
 # ── Step 7: EKS Cluster ────────────────────────────────────────────────────────
 echo ""
 echo "==> Step 7: Deleting EKS cluster '$CLUSTER'..."
@@ -231,28 +348,61 @@ echo "    Expected time: 10-15 minutes."
 echo ""
 
 CF_STACK="eksctl-${CLUSTER}-cluster"
+delete_cf_stack_with_retry() {
+  local stack="$1"
+  echo "    Triggering CloudFormation delete on '$stack'..."
+  aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"
+  echo "    Waiting for stack deletion (up to 30 min)..."
+  if aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION" 2>/dev/null; then
+    echo "    ✓ CloudFormation stack deleted"
+    return 0
+  fi
+  # Wait failed — describe to see why
+  local status
+  status=$(aws cloudformation describe-stacks --stack-name "$stack" --region "$REGION" \
+    --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_FOUND")
+  if [[ "$status" == "NOT_FOUND" ]]; then
+    echo "    ✓ Stack already gone"
+    return 0
+  fi
+  echo "    ⚠ Stack in state: $status — retrying once after 60s"
+  sleep 60
+  aws cloudformation delete-stack --stack-name "$stack" --region "$REGION"
+  aws cloudformation wait stack-delete-complete --stack-name "$stack" --region "$REGION" \
+    && echo "    ✓ Stack deleted on retry" \
+    || { echo "    ✗ Stack still failing — inspect manually:"; \
+         aws cloudformation describe-stack-events --stack-name "$stack" --region "$REGION" \
+           --max-items 10 --query 'StackEvents[?ResourceStatus==`DELETE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
+           --output table; \
+         return 1; }
+}
+
 CF_STATUS=$(aws cloudformation describe-stacks \
   --stack-name "$CF_STACK" --region "$REGION" \
   --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo "NOT_FOUND")
 
 if [[ "$CF_STATUS" == "DELETE_FAILED" ]]; then
-  echo "    ⚠ CloudFormation stack '$CF_STACK' is in DELETE_FAILED state."
-  echo "      This is usually caused by orphaned Lambda VPC ENIs (Step 3b should have"
-  echo "      cleared them). Retrying stack deletion now..."
+  echo "    ⚠ CloudFormation stack '$CF_STACK' is in DELETE_FAILED state — retrying."
   if [[ "$DRY_RUN" != "true" ]]; then
-    aws cloudformation delete-stack --stack-name "$CF_STACK" --region "$REGION"
-    echo "    Waiting for stack deletion..."
-    aws cloudformation wait stack-delete-complete --stack-name "$CF_STACK" --region "$REGION"
-    echo "    ✓ CloudFormation stack deleted"
+    delete_cf_stack_with_retry "$CF_STACK"
   else
-    echo "    [DRY RUN] aws cloudformation delete-stack --stack-name $CF_STACK --region $REGION"
+    echo "    [DRY RUN] aws cloudformation delete-stack --stack-name $CF_STACK"
   fi
 elif check aws eks describe-cluster --name "$CLUSTER" --region "$REGION"; then
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "    [DRY RUN] eksctl delete cluster --name $CLUSTER --region $REGION --wait"
   else
-    eksctl delete cluster --name "$CLUSTER" --region "$REGION" --wait
-    echo "    ✓ EKS cluster deleted"
+    if eksctl delete cluster --name "$CLUSTER" --region "$REGION" --wait; then
+      echo "    ✓ EKS cluster deleted"
+    else
+      echo "    ⚠ eksctl delete failed — falling back to direct CloudFormation deletion"
+      delete_cf_stack_with_retry "$CF_STACK" || true
+    fi
+  fi
+elif [[ "$CF_STATUS" != "NOT_FOUND" ]]; then
+  echo "    Cluster API gone but CF stack still present (state: $CF_STATUS) — deleting stack."
+  if [[ "$DRY_RUN" != "true" ]]; then
+    delete_cf_stack_with_retry "$CF_STACK"
   fi
 else
   echo "    ✓ EKS cluster not found — skipped"

@@ -24,7 +24,7 @@
 set -euo pipefail
 
 export AWS_PROFILE="${AWS_PROFILE:-fernhub}"
-REGION="ap-southeast-2"
+REGION="us-east-1"
 CLUSTER="otel-demo-prod"
 AGENT_NAMESPACE="k8s-agent"
 ACCOUNT_ID="637039075925"

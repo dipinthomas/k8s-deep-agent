@@ -16,7 +16,7 @@ set -euo pipefail
 
 NAMESPACE="otel-demo"
 TARGET_PCT="${TARGET_PCT:-78}"   # fill node disk to this percentage
-REGION="ap-southeast-2"
+REGION="us-east-1"
 
 echo "🔴 Triggering disk pressure demo scenario..."
 echo ""

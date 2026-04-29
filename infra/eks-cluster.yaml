@@ -3,7 +3,7 @@ kind: ClusterConfig
 
 metadata:
   name: otel-demo-prod
-  region: ap-southeast-2
+  region: us-east-1
   version: "1.33"
   tags:
     project: nz-tech-rally-demo

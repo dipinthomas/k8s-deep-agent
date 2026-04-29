@@ -11,7 +11,7 @@ data:
   config.json: |
     {
       "agent": {
-        "region": "ap-southeast-2"
+        "region": "us-east-1"
       },
       "logs": {
         "metrics_collected": {

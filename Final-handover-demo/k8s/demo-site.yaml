@@ -80,7 +80,7 @@ spec:
             - name: CLUSTER_NAME
               value: "otel-demo-prod"
             - name: AWS_REGION
-              value: "ap-southeast-2"
+              value: "us-east-1"
           resources:
             requests:
               cpu: "100m"
@@ -165,7 +165,7 @@ metadata:
     kubernetes.io/ingress.class: alb
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:ap-southeast-2:ACCOUNT_ID:certificate/CERT_ID"
+    alb.ingress.kubernetes.io/certificate-arn: "arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/CERT_ID"
     alb.ingress.kubernetes.io/ssl-redirect: "443"
     # SSE requires longer idle timeout — default 60s will kill the stream
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300

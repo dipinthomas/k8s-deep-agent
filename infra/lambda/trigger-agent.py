@@ -22,7 +22,7 @@ def lambda_handler(event, context):
     alarm_name = sns_message.get("AlarmName", "unknown")
     state = sns_message.get("NewStateValue", "UNKNOWN")
     reason = sns_message.get("NewStateReason", "")
-    region = sns_message.get("Region", "ap-southeast-2")
+    region = sns_message.get("Region", "us-east-1")
 
     # Extract node name from alarm dimensions if available
     dimensions = sns_message.get("Trigger", {}).get("Dimensions", [])

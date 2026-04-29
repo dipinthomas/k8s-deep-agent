@@ -551,7 +551,7 @@ Create a Deployment + Service for the MCP gateway pod:
 - **Container 2 — cloudwatch-mcp** (port 3002):
   - Run `uvx awslabs.cloudwatch-mcp-server@latest` with `--transport sse --port 3002`
   - Auth: IRSA (EKS injects `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE`)
-  - Env: `AWS_REGION=ap-southeast-2`
+  - Env: `AWS_REGION=us-east-1`
 - **Resources per container:** requests 128Mi/100m, limits 512Mi/500m
 - **Service:** ClusterIP (internal only), ports 3001 and 3002
 - **PriorityClass:** `infrastructure` (same as agent)
@@ -703,7 +703,7 @@ SYSTEM_PROMPT = """
 
 ---
 
-You are an autonomous Kubernetes operations agent for the otel-demo-prod cluster (EKS ap-southeast-2).
+You are an autonomous Kubernetes operations agent for the otel-demo-prod cluster (EKS us-east-1).
 
 Investigation approach:
 1. Acknowledge the incident in Slack immediately.
@@ -843,7 +843,7 @@ def build_agent():
 After:
 ```python
 SYSTEM_PROMPT = """
-You are an autonomous Kubernetes operations agent for the otel-demo-prod cluster (EKS ap-southeast-2).
+You are an autonomous Kubernetes operations agent for the otel-demo-prod cluster (EKS us-east-1).
 ...
 """
 

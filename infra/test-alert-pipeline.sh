@@ -15,7 +15,7 @@
 set -euo pipefail
 
 export AWS_PROFILE="${AWS_PROFILE:-fernhub}"
-REGION="ap-southeast-2"
+REGION="us-east-1"
 CLUSTER="otel-demo-prod"
 LAMBDA_NAME="eks-alarm-to-agent"                      # deployed by deploy-all.sh Step 5
 ALARM_NAME="EKS-NodeDiskPressure-${CLUSTER}"          # must match deploy-all.sh Step 5

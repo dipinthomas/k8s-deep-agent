@@ -43,7 +43,7 @@ The audience sees a complete incident lifecycle:
 
 ### 2b. The Infrastructure
 - **Cloud:** AWS
-- **Region:** ap-southeast-2 (Sydney)
+- **Region:** us-east-1 (N. Virginia)
 - **Kubernetes:** Amazon EKS
 - **Monitoring/Alerting:** Amazon CloudWatch + CloudWatch Container Insights
 - **Observability:** OTel Collector (comes with the demo app) → CloudWatch
@@ -138,7 +138,7 @@ who it is, what cluster it's looking at, and the rules it must follow.
 
 Content to write in `AGENTS.md`:
 ```markdown
-# Cluster Identity: otel-demo-prod (EKS ap-southeast-2)
+# Cluster Identity: otel-demo-prod (EKS us-east-1)
 
 ## What I Am
 I am an autonomous Kubernetes operations agent for the OTel Demo cluster.
@@ -520,7 +520,7 @@ echo "✅ Cluster reset complete"
 # Using eksctl
 eksctl create cluster \
   --name otel-demo-prod \
-  --region ap-southeast-2 \
+  --region us-east-1 \
   --nodegroup-name standard-workers \
   --node-type m5.2xlarge \
   --nodes 3 \
@@ -531,13 +531,13 @@ eksctl create cluster \
 # Enable CloudWatch Container Insights
 eksctl utils update-cluster-logging \
   --enable-types all \
-  --region ap-southeast-2 \
+  --region us-east-1 \
   --cluster otel-demo-prod
 
 aws eks update-addon \
   --cluster-name otel-demo-prod \
   --addon-name amazon-cloudwatch-observability \
-  --region ap-southeast-2
+  --region us-east-1
 ```
 
 ### Step 2 — Deploy PriorityClasses
@@ -584,7 +584,7 @@ pip install deepagents langchain-anthropic boto3 slack-sdk
 
 # Set environment variables
 export ANTHROPIC_API_KEY="..."
-export AWS_REGION="ap-southeast-2"
+export AWS_REGION="us-east-1"
 export SLACK_BOT_TOKEN="xoxb-..."
 export SLACK_CHANNEL="#k8s-alerts"
 export KUBECONFIG="~/.kube/config"
@@ -639,7 +639,7 @@ The fault injection scripts mean they can reproduce the exact demo scenario.
 
 ```bash
 # AWS
-AWS_REGION=ap-southeast-2
+AWS_REGION=us-east-1
 AWS_PROFILE=fernhub          # ALWAYS use this profile for this project
 
 # OpenAI (model: gpt-4.1-mini)

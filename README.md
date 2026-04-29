@@ -14,7 +14,7 @@ flowchart TD
         FI["trigger-disk-pressure.sh\n• load-generator → 500 users\n• image-provider nginx → debug logging\n• fallocate 60 GB fill in pod"]
     end
 
-    subgraph EKS["☸️ EKS Cluster — otel-demo-prod (ap-southeast-2)"]
+    subgraph EKS["☸️ EKS Cluster — otel-demo-prod (us-east-1)"]
         direction TB
         subgraph CRITICAL["payment-critical (priority 1,000,000)"]
             CO["checkoutservice"]
@@ -111,7 +111,7 @@ The agent:
 ```bash
 eksctl create cluster \
   --name otel-demo-prod \
-  --region ap-southeast-2 \
+  --region us-east-1 \
   --nodegroup-name standard-workers \
   --node-type m5.2xlarge \
   --nodes 3 \
@@ -122,13 +122,13 @@ eksctl create cluster \
 # Enable CloudWatch Container Insights
 eksctl utils update-cluster-logging \
   --enable-types all \
-  --region ap-southeast-2 \
+  --region us-east-1 \
   --cluster otel-demo-prod
 
 aws eks update-addon \
   --cluster-name otel-demo-prod \
   --addon-name amazon-cloudwatch-observability \
-  --region ap-southeast-2
+  --region us-east-1
 ```
 
 ### 2. Apply PriorityClasses
@@ -175,7 +175,7 @@ Required variables:
 
 ```bash
 # AWS
-AWS_REGION=ap-southeast-2
+AWS_REGION=us-east-1
 AWS_PROFILE=default
 
 # Anthropic

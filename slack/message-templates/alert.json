@@ -16,11 +16,11 @@
       "fields": [
         {
           "type": "mrkdwn",
-          "text": "*Cluster:*\notel-demo-prod (ap-southeast-2)"
+          "text": "*Cluster:*\notel-demo-prod (us-east-1)"
         },
         {
           "type": "mrkdwn",
-          "text": "*Node:*\nip-10-0-1-45.ap-southeast-2.compute.internal"
+          "text": "*Node:*\nip-10-0-1-45.us-east-1.compute.internal"
         },
         {
           "type": "mrkdwn",

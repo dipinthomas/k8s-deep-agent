@@ -102,7 +102,7 @@ spec:
             name: k8s-agent-secrets
         env:
         - name: AWS_REGION
-          value: "ap-southeast-2"
+          value: "us-east-1"
         - name: CLUSTER_NAME
           value: "otel-demo-prod"
         - name: AGENT_MODEL
@@ -204,7 +204,7 @@ spec:
           name: cloudwatch-mcp
         env:
         - name: AWS_REGION
-          value: "ap-southeast-2"
+          value: "us-east-1"
         resources:
           requests:
             memory: "256Mi"

@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")"
 
-AWS_REGION="${AWS_REGION:-ap-southeast-2}"
+AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 ECR_BASE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
 

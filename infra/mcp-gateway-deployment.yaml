@@ -139,7 +139,7 @@ spec:
           name: cloudwatch-mcp
         env:
         - name: AWS_REGION
-          value: "ap-southeast-2"
+          value: "us-east-1"
         # IRSA: EKS injects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE
         resources:
           requests:

@@ -5,11 +5,11 @@ description: Load this skill when operating against the otel-demo-prod cluster.
              and known incident patterns for the OpenTelemetry Astronomy Shop workload.
 ---
 
-# Cluster Context: otel-demo-prod (EKS ap-southeast-2)
+# Cluster Context: otel-demo-prod (EKS us-east-1)
 
 ## Cluster Facts
 
-- **Cloud:** AWS ap-southeast-2 (Sydney)
+- **Cloud:** AWS us-east-1 (N. Virginia)
 - **Platform:** Amazon EKS (managed Kubernetes)
 - **Observability:** OTel Collector → Amazon CloudWatch (Container Insights + custom metrics)
 - **Namespace:** `otel-demo` (all application workloads run here)
