@@ -12,6 +12,8 @@ spec:
     metadata:
       labels:
         app: agent-redis
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       containers:
       - name: redis

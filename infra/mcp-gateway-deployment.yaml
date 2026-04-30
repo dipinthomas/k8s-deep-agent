@@ -82,6 +82,8 @@ spec:
     metadata:
       labels:
         app: k8s-mcp-gateway
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: k8s-mcp-gateway
       containers:
