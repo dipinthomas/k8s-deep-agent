@@ -107,7 +107,7 @@ Known behaviours that help pattern-match incidents in this cluster:
 |---|---|---|
 | Node disk pressure | `DiskPressure=True` on node, pods evicted, imageprovider I/O spike | `node-disk-pressure` |
 | Noisy neighbour | One pod consuming disproportionate CPU/memory, co-located pods degraded | `noisy-neighbor` |
-| Checkout/payment degradation | Checkout p99 > 500ms, payment error rate rising | `checkout-protection` |
+| Checkout/payment degradation | Checkout p99 > 500ms, payment error rate rising | `critical-service-protection` |
 | Pod eviction decisions | Need to rank and select pods for eviction | `pod-priority-eviction` |
 | CrashLoopBackOff | High restart count, OOMKilled or application error in logs | kubectl events + CloudWatch logs |
 | Pending pods | Pods stuck Pending — insufficient resources or scheduling constraints | kubectl describe node + events |

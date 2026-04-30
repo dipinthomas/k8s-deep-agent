@@ -118,7 +118,7 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
         ),
         "tools": mcp_tools,
         "skills": [
-            "./skills/universal/checkout-protection/",
+            "./skills/universal/critical-service-protection/",
         ],
     }
 

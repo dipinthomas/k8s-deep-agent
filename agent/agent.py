@@ -195,12 +195,12 @@ through the approval gate. Standing down on the first error wastes the
 incident — the agent's job is to converge on a working fix.
 
 Preferred remediation for disk pressure:
-For this cluster, prefer `kubectl_delete pod <name> -n <namespace>` for each
-non-critical pod over a node-wide drain. The demo cluster has bare pods,
-DaemonSets, and emptyDir volumes that make `node_management` drain fail with
-unfixable obstacles. Targeted pod deletes are simpler, faster, and more
-predictable. See skills/universal/node-disk-pressure/SKILL.md for the full
-playbook.
+Prefer `kubectl_delete pod <name> -n <namespace>` for each non-critical pod
+over a node-wide drain. Real clusters commonly contain bare pods,
+DaemonSets, and emptyDir volumes that make `node_management` drain fail
+with unfixable obstacles. Targeted pod deletes are simpler, faster, and
+more predictable. See skills/universal/node-disk-pressure/SKILL.md for the
+full playbook.
 
 Non-negotiable rules:
 - ALWAYS post evidence to Slack and post_approval_request BEFORE calling a
