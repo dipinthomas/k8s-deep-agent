@@ -1,0 +1,107 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  IRSA role for the k8s-agent ServiceAccount. Grants CloudWatch metrics/logs
+  and X-Ray read access used by the agent and its CloudWatch MCP sidecar.
+
+Parameters:
+  ClusterStackName:
+    Type: String
+    Default: k8s-agent-cluster
+    Description: Name of the cluster CFN stack — used to import the OIDC provider.
+  AgentNamespace:
+    Type: String
+    Default: k8s-agent
+  ServiceAccountName:
+    Type: String
+    Default: k8s-agent
+  RoleName:
+    Type: String
+    Default: k8s-agent-irsa
+    Description: >
+      Fixed role name — referenced by infra/agent-deployment.yaml ServiceAccount
+      annotation. Changing this requires also updating that manifest.
+
+Resources:
+
+  CloudWatchReadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: k8s-agent-cloudwatch-read
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CloudWatchMetrics
+            Effect: Allow
+            Action:
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:DescribeAlarmsForMetric
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+              - cloudwatch:ListDashboards
+            Resource: '*'
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:StartQuery
+              - logs:GetQueryResults
+              - logs:StopQuery
+              - logs:DescribeLogGroups
+              - logs:DescribeLogStreams
+              - logs:GetLogEvents
+              - logs:FilterLogEvents
+            Resource: '*'
+          - Sid: XRayTraces
+            Effect: Allow
+            Action:
+              - xray:GetServiceGraph
+              - xray:GetTraceSummaries
+              - xray:GetTraceGraph
+              - xray:BatchGetTraces
+            Resource: '*'
+
+  AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      # AssumeRolePolicyDocument is built as a JSON string via Fn::Sub so the
+      # OIDC provider host+path can be substituted into IAM Condition KEYS
+      # (which is impossible with intrinsics applied to an object literal).
+      # CloudFormation accepts a JSON string here and parses it server-side.
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Federated": "${OidcArn}"},
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OidcKey}:sub": "system:serviceaccount:${AgentNamespace}:${ServiceAccountName}",
+                    "${OidcKey}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }]
+            }
+          - OidcArn:
+              Fn::ImportValue: !Sub '${ClusterStackName}-OidcProviderArn'
+            OidcKey:
+              Fn::Select:
+                - 1
+                - Fn::Split:
+                    - 'https://'
+                    - Fn::ImportValue: !Sub '${ClusterStackName}-OidcIssuerUrl'
+      ManagedPolicyArns:
+        - !Ref CloudWatchReadPolicy
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt AgentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleArn'
+  RoleName:
+    Value: !Ref AgentRole
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleName'

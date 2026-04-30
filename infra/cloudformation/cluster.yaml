@@ -1,0 +1,337 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EKS Auto Mode cluster (1.33) with VPC, OIDC provider, and CloudWatch logging
+  for the k8s-deep-agent demo. Replaces the eksctl-driven setup.
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: otel-demo-prod
+  KubernetesVersion:
+    Type: String
+    Default: '1.33'
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+Mappings:
+  AZIndex:
+    us-east-1:
+      AZs: [us-east-1a, us-east-1b]
+
+Resources:
+
+  # ── VPC ─────────────────────────────────────────────────────────────────────
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-vpc'
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-igw'
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/20
+      AvailabilityZone: !Select [0, !FindInMap [AZIndex, !Ref AWS::Region, AZs]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-1'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.16.0/20
+      AvailabilityZone: !Select [1, !FindInMap [AZIndex, !Ref AWS::Region, AZs]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-2'
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.32.0/20
+      AvailabilityZone: !Select [0, !FindInMap [AZIndex, !Ref AWS::Region, AZs]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-1'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.48.0/20
+      AvailabilityZone: !Select [1, !FindInMap [AZIndex, !Ref AWS::Region, AZs]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-2'
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-nat'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicRouteAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicRouteAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ClusterName}-private-rt'
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateRouteAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateRouteAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ── EKS IAM Roles ───────────────────────────────────────────────────────────
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cluster-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSComputePolicy
+        - arn:aws:iam::aws:policy/AmazonEKSBlockStoragePolicy
+        - arn:aws:iam::aws:policy/AmazonEKSLoadBalancingPolicy
+        - arn:aws:iam::aws:policy/AmazonEKSNetworkingPolicy
+
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-node-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly
+
+  # ── Cluster Logging ─────────────────────────────────────────────────────────
+  ClusterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/eks/${ClusterName}/cluster'
+      RetentionInDays: 7
+
+  # ── EKS Cluster (Auto Mode) ─────────────────────────────────────────────────
+  Cluster:
+    Type: AWS::EKS::Cluster
+    DependsOn:
+      - ClusterLogGroup
+      - PrivateRouteAssoc1
+      - PrivateRouteAssoc2
+      - PublicRouteAssoc1
+      - PublicRouteAssoc2
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: true
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PublicSubnet1
+          - !Ref PublicSubnet2
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+      ComputeConfig:
+        Enabled: true
+        NodePools:
+          - general-purpose
+          - system
+        NodeRoleArn: !GetAtt NodeRole.Arn
+      KubernetesNetworkConfig:
+        ElasticLoadBalancing:
+          Enabled: true
+        IpFamily: ipv4
+      StorageConfig:
+        BlockStorage:
+          Enabled: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      Tags:
+        - Key: project
+          Value: nz-tech-rally-demo
+        - Key: owner
+          Value: dipin
+
+  # ── OIDC Provider (for IRSA) ────────────────────────────────────────────────
+  # Cluster.OpenIdConnectIssuerUrl is exposed as a stack attribute since 2024.
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt Cluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        # AWS-managed thumbprint — verified automatically when ClientId list is used.
+        - 9e99a48a9960b14926bb7f3b02e22da2b0ab7280
+
+  # Note: BootstrapClusterCreatorAdminPermissions=true on the cluster grants
+  # cluster-admin to the IAM principal that created the stack (the deploy
+  # operator's SSO role). No explicit AccessEntry resource is needed for them.
+  # To grant additional principals, add AWS::EKS::AccessEntry resources here.
+
+  # ── CloudWatch Container Insights ───────────────────────────────────────────
+  # Pod Identity is used instead of IRSA so the trust policy is static and
+  # doesn't depend on the cluster's OIDC issuer URL. Auto Mode includes the
+  # Pod Identity Agent — no extra install needed.
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ClusterName}-cloudwatch-agent'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+
+  CloudWatchObservabilityAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: Cluster
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: amazon-cloudwatch-observability
+      ResolveConflicts: OVERWRITE
+      PodIdentityAssociations:
+        - ServiceAccount: cloudwatch-agent
+          RoleArn: !GetAtt CloudWatchAgentRole.Arn
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterArn'
+  OidcIssuerUrl:
+    Value: !GetAtt Cluster.OpenIdConnectIssuerUrl
+    Export:
+      Name: !Sub '${AWS::StackName}-OidcIssuerUrl'
+  OidcProviderArn:
+    Value: !Ref OidcProvider
+    Export:
+      Name: !Sub '${AWS::StackName}-OidcProviderArn'
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+  VpcCidr:
+    Value: !GetAtt Vpc.CidrBlock
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcCidr'

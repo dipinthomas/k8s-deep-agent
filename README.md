@@ -97,139 +97,77 @@ The agent:
 ## Prerequisites
 
 - AWS account with EKS, CloudWatch, and IAM permissions
-- `eksctl`, `kubectl`, `helm`, `aws` CLI installed
-- Slack workspace with bot creation permissions
+- `aws`, `kubectl`, `helm`, `docker`, `curl` installed
+- Slack workspace with bot + webhook
 - Python 3.11+
-- Anthropic API key
+- OpenAI API key
 
 ---
 
 ## Quick Start
 
-### 1. Deploy EKS Cluster
+The whole AWS stack is managed by three CloudFormation templates under
+[`infra/cloudformation/`](infra/cloudformation/) and one orchestrator script.
+
+### 1. Configure secrets
 
 ```bash
-eksctl create cluster \
-  --name otel-demo-prod \
-  --region us-east-1 \
-  --nodegroup-name standard-workers \
-  --node-type m5.2xlarge \
-  --nodes 3 \
-  --nodes-min 2 \
-  --nodes-max 4 \
-  --managed
-
-# Enable CloudWatch Container Insights
-eksctl utils update-cluster-logging \
-  --enable-types all \
-  --region us-east-1 \
-  --cluster otel-demo-prod
-
-aws eks update-addon \
-  --cluster-name otel-demo-prod \
-  --addon-name amazon-cloudwatch-observability \
-  --region us-east-1
+cp infra/agent-secrets.example.yaml infra/agent-secrets.yaml
+# Edit infra/agent-secrets.yaml — fill in OPENAI_API_KEY, SLACK_*, etc.
 ```
 
-### 2. Apply PriorityClasses
+### 2. Deploy the stack
 
 ```bash
-kubectl apply -f infra/priority-classes.yaml
+AWS_PROFILE=fernhub bash infra/deploy.sh
 ```
 
-### 3. Deploy OTel Demo App
+The script deploys, in order:
+
+1. **`k8s-agent-cluster`** — VPC, EKS Auto Mode 1.33, OIDC provider,
+   Container Insights addon (Pod Identity).
+2. **`k8s-agent-iam`** — IRSA role for the agent ServiceAccount.
+3. Kubernetes manifests — priority classes, Container Insights config, Redis,
+   agent secrets, agent + MCP gateway deployments.
+
+First-time deploy takes ~20 minutes. Re-running is idempotent and applies only
+changed resources.
+
+> The CloudWatch-alarm → SNS → Lambda → agent pipeline is currently disabled.
+> Trigger the agent manually with a POST to its NLB `/trigger` endpoint, or
+> reintroduce a CFN stack for it later.
+
+### 3. Deploy the OTel demo workload (only when running the demo)
 
 ```bash
 bash otel-demo/deploy.sh
+bash infra/patch-priority-classes.sh
 ```
 
-### 4. Configure CloudWatch Alarm
+### 4. Update agent image (no stack changes)
 
 ```bash
-# Replace <SNS_TOPIC_ARN_FOR_SLACK> with your SNS topic ARN
-aws cloudwatch put-metric-alarm \
-  --alarm-name "EKS-NodeDiskPressure-otel-demo" \
-  --alarm-description "Node disk usage above 80% in otel-demo cluster" \
-  --metric-name node_filesystem_utilization \
-  --namespace ContainerInsights \
-  --statistic Average \
-  --period 60 \
-  --threshold 80 \
-  --comparison-operator GreaterThanThreshold \
-  --evaluation-periods 2 \
-  --alarm-actions <SNS_TOPIC_ARN_FOR_SLACK>
+bash infra/update-agent.sh v31
 ```
 
-### 5. Set Up Slack Bot
+Builds + pushes the multi-arch image and rolls out the deployment without
+touching CloudFormation.
 
-See [slack/bot-setup.md](slack/bot-setup.md) for full instructions.
-
-### 6. Configure Environment Variables
+### 5. Tear everything down
 
 ```bash
-cp agent/.env.example agent/.env
-# Edit agent/.env with your credentials
+AWS_PROFILE=fernhub bash infra/destroy.sh
 ```
 
-Required variables:
+Deletes the three stacks in reverse order. The script first removes the
+agent's `LoadBalancer` Service so the AWS Load Balancer Controller releases
+the NLB before the cluster stack tries to delete the subnets.
 
-```bash
-# AWS
-AWS_REGION=us-east-1
-AWS_PROFILE=default
+### Slack setup
 
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-...
-
-# Slack
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_SIGNING_SECRET=...
-SLACK_CHANNEL_ID=C...
-
-# Cluster
-CLUSTER_NAME=otel-demo-prod
-KUBECONFIG=~/.kube/config
-
-# MCP Servers
-KUBECTL_MCP_PORT=3001
-CLOUDWATCH_MCP_PORT=3002
-SLACK_MCP_PORT=3003
-
-# Optional: LangSmith tracing
-LANGSMITH_TRACING=true
-LANGSMITH_API_KEY=ls__...
-```
-
-### 7. Install Python Dependencies
-
-```bash
-cd agent
-pip install -r requirements.txt
-```
-
-### 8. Start MCP Servers
-
-The agent uses direct Python tool implementations (boto3, kubectl, Slack SDK) by default.
-The MCP server definitions in `agent/mcp/servers.yaml` are provided for reference if you
-want to swap to an MCP-based tool layer.
-
-```bash
-# Kubernetes MCP server (stdio)
-npx mcp-server-kubernetes
-
-# CloudWatch MCP server (Python — requires uvx)
-uvx awslabs.cloudwatch-mcp-server@latest
-
-# Slack MCP server (stdio)
-npx @modelcontextprotocol/server-slack
-```
-
-### 9. Run the Agent
-
-```bash
-cd agent
-python main.py
-```
+See [slack/bot-setup.md](slack/bot-setup.md) for creating the bot and webhook.
+The credentials go into `infra/agent-secrets.yaml` (template:
+`infra/agent-secrets.example.yaml`) and are mounted into the agent pod.
 
 ---
 
@@ -271,10 +209,17 @@ bash fault-injection/reset-cluster.sh
 ├── AGENTS.md                    # Cluster identity — always loaded by agent
 ├── README.md                    # This file
 ├── infra/
-│   ├── eks-cluster.tf           # Terraform for EKS cluster
-│   ├── eks-cluster.yaml         # eksctl cluster config (alternative)
-│   ├── cloudwatch-agent.yaml    # CloudWatch Container Insights setup
-│   └── priority-classes.yaml   # K8s PriorityClass definitions
+│   ├── deploy.sh                # Orchestrator: CFN deploy + kubectl apply
+│   ├── destroy.sh               # Orchestrator: CFN delete (reverse order)
+│   ├── update-agent.sh          # Push new image + roll out (no CFN change)
+│   ├── cloudformation/
+│   │   ├── cluster.yaml         # VPC + EKS Auto Mode + OIDC + CW addon
+│   │   └── agent-iam.yaml       # IRSA role for the agent ServiceAccount
+│   ├── agent-deployment.yaml    # Agent + MCP sidecars manifest
+│   ├── mcp-gateway-deployment.yaml
+│   ├── redis-deployment.yaml    # Agent checkpoint/memory store
+│   ├── cloudwatch-agent.yaml    # Container Insights ConfigMap
+│   └── priority-classes.yaml    # K8s PriorityClass definitions
 ├── otel-demo/
 │   ├── values.yaml              # Helm values for OTel demo
 │   └── deploy.sh                # One-command deploy script
