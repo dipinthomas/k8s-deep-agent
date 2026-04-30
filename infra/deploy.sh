@@ -29,6 +29,10 @@ export AWS_PROFILE="${AWS_PROFILE:-fernhub}"
 REGION="us-east-1"
 CLUSTER="otel-demo-prod"
 AGENT_NAMESPACE="k8s-agent"
+# Toggle Container Insights metrics + Fluent Bit log shipping. Off by default
+# (saves ~$5-20/day in CloudWatch ingest cost on an idle cluster). Turn on
+# before running a demo: INSTALL_OBSERVABILITY=true bash infra/deploy.sh
+INSTALL_OBSERVABILITY="${INSTALL_OBSERVABILITY:-false}"
 
 CLUSTER_STACK="k8s-agent-cluster"
 IAM_STACK="k8s-agent-iam"
@@ -147,8 +151,9 @@ echo "    First-time creation: 15-20 min. Updates: usually < 1 min."
 
 deploy_stack "$CLUSTER_STACK" "$CFN_DIR/cluster.yaml" \
   "ClusterName=$CLUSTER" \
+  "InstallObservability=$INSTALL_OBSERVABILITY" \
   || die "Cluster stack deployment failed — check CloudFormation console"
-ok "Cluster stack deployed"
+ok "Cluster stack deployed (observability addon: $INSTALL_OBSERVABILITY)"
 
 aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION" &>/dev/null
 ok "kubeconfig updated"
@@ -174,15 +179,20 @@ kubectl apply -f "$SCRIPT_DIR/priority-classes.yaml" \
 ok "Priority classes applied"
 
 # CloudWatch Container Insights ConfigMap — tunes disk metric collection.
-# The amazon-cloudwatch namespace is created by the addon installed in Step 1.
-echo "    Waiting for amazon-cloudwatch namespace..."
-for i in $(seq 1 30); do
-  kubectl get ns amazon-cloudwatch &>/dev/null && break
-  sleep 5
-done
-kubectl apply -f "$SCRIPT_DIR/cloudwatch-agent.yaml" \
-  && ok "Container Insights ConfigMap applied" \
-  || warn "ConfigMap apply failed — addon may still be installing; rerun deploy.sh shortly"
+# Only meaningful when the observability addon is installed; the namespace
+# is created by that addon.
+if [[ "$INSTALL_OBSERVABILITY" == "true" ]]; then
+  echo "    Waiting for amazon-cloudwatch namespace..."
+  for i in $(seq 1 30); do
+    kubectl get ns amazon-cloudwatch &>/dev/null && break
+    sleep 5
+  done
+  kubectl apply -f "$SCRIPT_DIR/cloudwatch-agent.yaml" \
+    && ok "Container Insights ConfigMap applied" \
+    || warn "ConfigMap apply failed — addon may still be installing; rerun deploy.sh shortly"
+else
+  ok "Skipping Container Insights ConfigMap (INSTALL_OBSERVABILITY=false)"
+fi
 
 # Agent namespace + Redis + secrets + agent + MCP gateway.
 kubectl create namespace "$AGENT_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -

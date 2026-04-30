@@ -13,6 +13,17 @@ Parameters:
   VpcCidr:
     Type: String
     Default: 10.0.0.0/16
+  InstallObservability:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Install the amazon-cloudwatch-observability addon (Container Insights
+      metrics + Fluent Bit log shipping). Off by default to avoid standing
+      CloudWatch ingest cost; turn on before running a demo.
+
+Conditions:
+  ObservabilityEnabled: !Equals [!Ref InstallObservability, 'true']
 
 Mappings:
   AZIndex:
@@ -278,12 +289,13 @@ Resources:
   # operator's SSO role). No explicit AccessEntry resource is needed for them.
   # To grant additional principals, add AWS::EKS::AccessEntry resources here.
 
-  # ── CloudWatch Container Insights ───────────────────────────────────────────
+  # ── CloudWatch Container Insights (optional, gated by InstallObservability) ─
   # Pod Identity is used instead of IRSA so the trust policy is static and
   # doesn't depend on the cluster's OIDC issuer URL. Auto Mode includes the
   # Pod Identity Agent — no extra install needed.
   CloudWatchAgentRole:
     Type: AWS::IAM::Role
+    Condition: ObservabilityEnabled
     Properties:
       RoleName: !Sub '${ClusterName}-cloudwatch-agent'
       AssumeRolePolicyDocument:
@@ -301,6 +313,7 @@ Resources:
 
   CloudWatchObservabilityAddon:
     Type: AWS::EKS::Addon
+    Condition: ObservabilityEnabled
     DependsOn: Cluster
     Properties:
       ClusterName: !Ref Cluster

@@ -124,11 +124,11 @@ AWS_PROFILE=fernhub bash infra/deploy.sh
 
 The script deploys, in order:
 
-1. **`k8s-agent-cluster`** — VPC, EKS Auto Mode 1.33, OIDC provider,
-   Container Insights addon (Pod Identity).
+1. **`k8s-agent-cluster`** — VPC, EKS Auto Mode 1.33, OIDC provider.
+   (Container Insights addon is opt-in — see below.)
 2. **`k8s-agent-iam`** — IRSA role for the agent ServiceAccount.
-3. Kubernetes manifests — priority classes, Container Insights config, Redis,
-   agent secrets, agent + MCP gateway deployments.
+3. Kubernetes manifests — priority classes, Redis, agent secrets, agent +
+   MCP gateway deployments.
 
 First-time deploy takes ~20 minutes. Re-running is idempotent and applies only
 changed resources.
@@ -136,6 +136,20 @@ changed resources.
 > The CloudWatch-alarm → SNS → Lambda → agent pipeline is currently disabled.
 > Trigger the agent manually with a POST to its NLB `/trigger` endpoint, or
 > reintroduce a CFN stack for it later.
+
+#### Toggle Container Insights
+
+The `amazon-cloudwatch-observability` addon ships pod metrics + logs to
+CloudWatch and feeds the agent's CloudWatch MCP investigations. It costs
+~$5–20/day on an idle cluster, so it's off by default.
+
+```bash
+# Turn on before a demo (re-runs the cluster stack with the addon)
+INSTALL_OBSERVABILITY=true AWS_PROFILE=fernhub bash infra/deploy.sh
+
+# Turn off again afterwards (CFN deletes the addon and its IAM role)
+INSTALL_OBSERVABILITY=false AWS_PROFILE=fernhub bash infra/deploy.sh
+```
 
 ### 3. Deploy the OTel demo workload (only when running the demo)
 
