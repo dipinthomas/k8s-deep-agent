@@ -11,11 +11,27 @@ a summary it considers "the answer". LangGraph then exits and the user is
 left with a half-finished investigation — exactly what Deep Agents'
 plan/act/observe loop is supposed to prevent.
 
-The middleware sits between deepagents' base stack and the tail stack
-(AnthropicPromptCachingMiddleware, MemoryMiddleware, HumanInTheLoopMiddleware,
-in that order). This means our after_model hook runs AFTER the model emits
-the response but BEFORE HITL inspects it for interrupts — so if the model
-correctly queued a destructive tool, HITL still gets to arm its gate.
+== Known limitation observed in v39 (2026-05-01) ==
+
+When the model queues a destructive tool in the SAME AIMessage as
+post_to_slack / post_approval_request siblings, langchain's
+HumanInTheLoopMiddleware fires its __interrupt__ BEFORE this middleware's
+after_model / aafter_model hook is invoked at all. The agent stream
+chunks go straight from {'model': ...} to {'__interrupt__': ...} with no
+{'KeepLoopingMiddleware.after_model': ...} chunk in between.
+
+That means in-band Slack-tool execution from inside this middleware
+cannot rescue the parallel Slack siblings on a destructive turn — the
+hook never runs. Confirmed empirically with claude-haiku-4-5 across
+runs 8/9/10 on 2026-05-01. v36/v38 attempted to recover from main.py
+_drive after the interrupt fires; that worked for posting Slack but
+broke the resume path because aupdate_state mid-stream re-evaluates the
+graph and produces stale interrupt metadata.
+
+The reliable fix lives at the tool boundary, not in middleware:
+post_approval_request itself can post a findings message when called
+without a prior post_to_slack on the thread. That keeps the human
+visibility guarantee without depending on middleware ordering.
 """
 
 from __future__ import annotations
