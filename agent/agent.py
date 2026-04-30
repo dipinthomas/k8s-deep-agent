@@ -316,11 +316,16 @@ def _build_model_with_timeout(model_spec: str):
         # /chat/completions. NOT setting use_previous_response_id (which would
         # also drop history from the payload) — that interacts badly with
         # langgraph interrupt resume.
+        # parallel_tool_calls=True lets the model emit post_approval_request
+        # AND the destructive kubectl tool in the same turn, which is required
+        # for the human-in-the-loop gate to arm. Without this, gpt-5-mini
+        # consistently emits only one tool per turn.
         return ChatOpenAI(
             model=model_name,
             use_responses_api=True,
             timeout=_LLM_TIMEOUT_SEC,
             max_retries=_LLM_MAX_RETRIES,
+            model_kwargs={"parallel_tool_calls": True},
         )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic

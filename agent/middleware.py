@@ -45,10 +45,25 @@ STAND_DOWN_PHRASES = (
 
 
 class KeepLoopingState(TypedDict):
-    """Extra state field added by KeepLoopingMiddleware. Persisted across
-    turns via the checkpointer so the flag survives interrupts."""
+    """Extra state fields added by KeepLoopingMiddleware. Persisted across
+    turns via the checkpointer so they survive interrupts.
+
+    explicit_stand_down: set when the agent has declared the investigation
+        is over (mark_stand_down called or stand-down phrase posted).
+    unarmed_gate_retry_count: number of consecutive turns where
+        post_approval_request was called without queuing a destructive tool.
+        Used to escalate the corrective message after repeated failures so
+        the agent does not spam Slack indefinitely.
+    """
 
     explicit_stand_down: NotRequired[bool]
+    unarmed_gate_retry_count: NotRequired[int]
+
+
+# After this many consecutive turns of "post_approval_request without a
+# destructive tool", we escalate to demanding mark_stand_down so the loop
+# terminates rather than spinning forever.
+_MAX_UNARMED_GATE_RETRIES = 2
 
 
 class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
@@ -150,13 +165,51 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
                 # whether the most recent ToolMessage in history corresponds
                 # to a destructive tool that just succeeded.
                 if self._destructive_just_executed(messages):
-                    return None
+                    return {"unarmed_gate_retry_count": 0}
+
+                retry_count = int(state.get("unarmed_gate_retry_count") or 0)
+                next_count = retry_count + 1
+
+                if next_count > _MAX_UNARMED_GATE_RETRIES:
+                    # Escalation: the model has now failed `_MAX_UNARMED_GATE_RETRIES`
+                    # times to queue the destructive tool alongside post_approval_request.
+                    # Stop asking nicely — demand mark_stand_down so the loop terminates.
+                    logger.error(
+                        "KeepLooping: post_approval_request called without a "
+                        "destructive tool for the %dth consecutive turn — "
+                        "demanding mark_stand_down to terminate the loop",
+                        next_count,
+                    )
+                    return {
+                        "unarmed_gate_retry_count": next_count,
+                        "messages": [
+                            HumanMessage(
+                                content=(
+                                    f"STOP. You have called post_approval_request "
+                                    f"{next_count} times in a row WITHOUT queuing the "
+                                    "destructive kubectl tool in the same turn. The "
+                                    "approval gate cannot arm and Slack is being "
+                                    "spammed with duplicate approval cards.\n\n"
+                                    "Do NOT call post_approval_request again. Do NOT "
+                                    "call post_to_slack with another summary. Your "
+                                    "ONLY valid next action is:\n"
+                                    "  mark_stand_down(reason=\"Could not arm the "
+                                    "approval gate after repeated retries\")\n\n"
+                                    "Call mark_stand_down now. This is the only way "
+                                    "to end the loop cleanly."
+                                )
+                            )
+                        ],
+                    }
+
                 logger.warning(
                     "KeepLooping: post_approval_request called without a "
-                    "destructive tool in the same turn — injecting corrective "
-                    "HumanMessage so the gate can be armed"
+                    "destructive tool in the same turn (retry %d/%d) — injecting "
+                    "corrective HumanMessage so the gate can be armed",
+                    next_count, _MAX_UNARMED_GATE_RETRIES,
                 )
                 return {
+                    "unarmed_gate_retry_count": next_count,
                     "messages": [
                         HumanMessage(
                             content=(
@@ -172,9 +225,14 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
                                 "pending interrupt."
                             )
                         )
-                    ]
+                    ],
                 }
 
+        # Reset the retry counter once we see any other state — the model
+        # has either queued a destructive tool, called mark_stand_down, or
+        # is doing genuine investigation work.
+        if state.get("unarmed_gate_retry_count"):
+            return {"unarmed_gate_retry_count": 0}
         return None
 
     # ── Helpers ─────────────────────────────────────────────────────────────

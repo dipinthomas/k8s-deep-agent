@@ -9,6 +9,7 @@ Routing rules (enforced — the model cannot override):
   lands in the alarm's thread, never the channel root.
 """
 
+import hashlib
 import os
 import logging
 from typing import Annotated
@@ -20,6 +21,14 @@ from slack_sdk.errors import SlackApiError
 logger = logging.getLogger(__name__)
 
 _client = None
+
+# Per-thread fingerprint of the last approval card we posted. If the model
+# tries to post an identical (or near-identical) card again — which is the
+# classic "gate never armed, model retries" failure mode — we refuse and
+# return an instructive error instead of spamming Slack.
+# Process-local is fine: the agent runs as a single long-lived pod and
+# investigations are scoped to that process.
+_LAST_APPROVAL_FINGERPRINT: dict[str, str] = {}
 
 
 def _slack():
@@ -108,6 +117,31 @@ def post_approval_request(
                      same turn.
         impact:      What will be affected by the actions
     """
+    channel, thread_ts = _route(config)
+
+    # Dedup guard: if we already posted an identical approval card to this
+    # thread, refuse to post again. This prevents the "model loops on
+    # post_approval_request without queuing the destructive tool" failure
+    # from spamming Slack with duplicate cards.
+    fingerprint = hashlib.sha256(
+        "|".join([summary, evidence, action_list, impact]).encode("utf-8")
+    ).hexdigest()
+    thread_key = f"{channel}:{thread_ts}"
+    if _LAST_APPROVAL_FINGERPRINT.get(thread_key) == fingerprint:
+        logger.warning(
+            "post_approval_request DEDUP: identical approval card already posted "
+            "to thread %s — refusing to post again", thread_key,
+        )
+        return (
+            "ERROR: An identical approval card has ALREADY been posted to this "
+            "thread. Do NOT call post_approval_request again with the same "
+            "content. Your next action must be ONE of: (a) call the destructive "
+            "kubectl tool from action_list NOW so the human-in-the-loop gate "
+            "arms and the existing APPROVE/DENY buttons can resume it; or "
+            "(b) call mark_stand_down(reason=\"...\") if you cannot proceed. "
+            "Do NOT re-post the approval card."
+        )
+
     blocks = [
         {
             "type": "header",
@@ -128,7 +162,6 @@ def post_approval_request(
         },
     ]
 
-    channel, thread_ts = _route(config)
     ts, err = _post(
         "post_approval_request", channel, thread_ts,
         text=f"⚠️ Approval required: {summary}",
@@ -136,6 +169,7 @@ def post_approval_request(
     )
     if err:
         return f"Slack error posting approval request: {err}"
+    _LAST_APPROVAL_FINGERPRINT[thread_key] = fingerprint
     return (
         f"Approval UI posted to thread (ts={ts}). This tool does NOT pause "
         "the graph. You MUST now, in this same turn, call the destructive "

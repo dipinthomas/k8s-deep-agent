@@ -95,7 +95,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v30
+        image: dipinthomas2003/k8s-deep-agent:v31
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -106,7 +106,7 @@ spec:
         - name: CLUSTER_NAME
           value: "otel-demo-prod"
         - name: AGENT_MODEL
-          value: "openai:gpt-5-mini"
+          value: "openai:gpt-5"
         - name: LOG_LEVEL
           value: "DEBUG"
         # Cluster-specific skill injected at deploy time — change this to switch clusters.
