@@ -20,11 +20,54 @@ REDIS_URL = os.environ.get("REDIS_URL", "")
 
 def build_memory_store():
     """
-    Build the memory store. Uses Redis if REDIS_URL is set, otherwise InMemoryStore.
-    Seeding is done separately via seed_memory_store() at agent startup.
+    Build the in-memory store synchronously. Used as a fallback when REDIS_URL
+    is unset or the async Redis store cannot be initialised.
+
+    For Redis-backed persistence prefer build_memory_store_async() — that
+    function returns a store whose data survives pod restarts so cross-
+    incident learnings accumulate.
     """
-    logger.info("Using InMemoryStore (Redis Stack required for persistent store)")
+    logger.info("Using InMemoryStore (no REDIS_URL set, or async builder not used)")
     return InMemoryStore()
+
+
+async def build_memory_store_async():
+    """
+    Build a Redis-backed long-term memory store when REDIS_URL is set.
+    Falls back to InMemoryStore if Redis is unavailable or langgraph's
+    redis store extra is not installed — in that case incident history is
+    lost on pod restart, but the agent still runs.
+
+    MUST be awaited from within the persistent agent event loop so the
+    store's HTTP/Redis connections are bound to that loop.
+    """
+    if not REDIS_URL:
+        logger.info("REDIS_URL not set — using InMemoryStore for long-term memory")
+        return InMemoryStore()
+    try:
+        from langgraph.store.redis.aio import AsyncRedisStore  # type: ignore
+    except ImportError:
+        logger.warning(
+            "langgraph[redis] store extra not installed — falling back to "
+            "InMemoryStore. Install with: pip install langgraph[redis]"
+        )
+        return InMemoryStore()
+    try:
+        # Direct construction (not via from_conn_string contextmanager) so the
+        # store outlives a single `async with` block — the agent process holds
+        # it for its entire lifetime.
+        store = AsyncRedisStore(redis_url=REDIS_URL)
+        await store.__aenter__()  # type: ignore[attr-defined]
+        await store.setup()
+        await store.aset_client_info()
+        logger.info("Using AsyncRedisStore at %s for long-term memory", REDIS_URL)
+        return store
+    except Exception as e:
+        logger.exception(
+            "AsyncRedisStore initialisation failed (%s) — falling back to "
+            "InMemoryStore. Cross-incident learnings will not persist.", e,
+        )
+        return InMemoryStore()
 
 
 def seed_memory_store(store) -> None:
