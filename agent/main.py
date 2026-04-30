@@ -377,7 +377,7 @@ async def _recover_stranded_slack_tools(thread_ts: str, channel: str) -> None:
     immediately after'.
     """
     from langchain_core.messages import AIMessage, ToolMessage
-    from agent.tools.slack_tools import post_to_slack, post_approval_request
+    from tools.slack_tools import post_to_slack, post_approval_request
 
     cfg = agent_config(thread_ts, channel)
     try:
