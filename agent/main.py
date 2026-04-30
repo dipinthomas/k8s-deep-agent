@@ -299,6 +299,18 @@ def stream_agent(payload, thread_ts: str, channel: str) -> None:
                 _scan_chunk_for_slack_posts(chunk, posted_to_slack)
                 if isinstance(chunk, dict) and "__interrupt__" in chunk:
                     paused_hb.set()
+                    # When HITL fires on a destructive tool, sibling parallel
+                    # post_approval_request / post_to_slack calls in the SAME
+                    # AIMessage are stranded — the graph yields before they
+                    # execute. KeepLoopingMiddleware can't catch this in
+                    # current langchain versions because HITL's interrupt
+                    # yields the runner before sibling middleware run. Recover
+                    # by executing the stranded Slack tools ourselves and
+                    # injecting their results into state, so the human sees
+                    # the buttons AND the resumed graph has matching
+                    # tool_use/tool_result pairs (otherwise Anthropic returns
+                    # 400 "tool_use without tool_result").
+                    await _recover_stranded_slack_tools(thread_ts, channel)
         await asyncio.wait_for(_drive(), timeout=_STREAM_TIMEOUT_SEC)
 
     started = time.time()
@@ -352,6 +364,95 @@ def _scan_chunk_for_slack_posts(chunk, flag: dict) -> None:
     except Exception:
         # Detection is best-effort — never break the stream over it.
         pass
+
+
+async def _recover_stranded_slack_tools(thread_ts: str, channel: str) -> None:
+    """When HITL fires on a destructive tool, sibling Slack tool calls in the
+    same AIMessage never run. Find them in current state, execute them
+    directly, and inject synthetic ToolMessage results so the message history
+    has matching tool_use/tool_result pairs on resume.
+
+    Without the synthetic ToolMessages, Anthropic rejects the next request
+    with HTTP 400: 'tool_use ids were found without tool_result blocks
+    immediately after'.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+    from agent.tools.slack_tools import post_to_slack, post_approval_request
+
+    cfg = agent_config(thread_ts, channel)
+    try:
+        state = await agent.aget_state(cfg)
+    except Exception:
+        logger.exception(
+            "Stranded-Slack recovery: could not read state for thread_ts=%s",
+            thread_ts,
+        )
+        return
+
+    values = getattr(state, "values", None) or {}
+    messages = values.get("messages") if isinstance(values, dict) else None
+    if not messages:
+        return
+
+    last_ai = next(
+        (m for m in reversed(messages) if isinstance(m, AIMessage)),
+        None,
+    )
+    if last_ai is None:
+        return
+
+    tool_calls = list(getattr(last_ai, "tool_calls", None) or [])
+    if not tool_calls:
+        return
+
+    existing_results = {
+        getattr(m, "tool_call_id", None)
+        for m in messages
+        if isinstance(m, ToolMessage)
+    }
+
+    handlers = {
+        "post_to_slack": post_to_slack,
+        "post_approval_request": post_approval_request,
+    }
+
+    new_tool_messages: list[ToolMessage] = []
+    for tc in tool_calls:
+        name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        if name not in handlers or tc_id in existing_results:
+            continue
+
+        handler = handlers[name]
+        args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+        try:
+            result = await handler.ainvoke({**(args or {})}, cfg)
+        except Exception as exc:
+            logger.exception(
+                "Stranded-Slack recovery: %s failed for thread_ts=%s",
+                name, thread_ts,
+            )
+            result = f"Stranded-Slack recovery error: {exc!r}"
+
+        logger.warning(
+            "Stranded-Slack recovery: executed %s (tc_id=%s) on thread_ts=%s "
+            "after HITL interrupt stranded it",
+            name, tc_id, thread_ts,
+        )
+        new_tool_messages.append(
+            ToolMessage(content=str(result), name=name, tool_call_id=tc_id)
+        )
+
+    if not new_tool_messages:
+        return
+
+    try:
+        await agent.aupdate_state(cfg, {"messages": new_tool_messages})
+    except Exception:
+        logger.exception(
+            "Stranded-Slack recovery: aupdate_state failed for thread_ts=%s",
+            thread_ts,
+        )
 
 
 def _safety_net_post_final_message(thread_ts: str, channel: str) -> None:
