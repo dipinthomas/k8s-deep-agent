@@ -116,6 +116,55 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
             )
             return {"explicit_stand_down": True}
 
+        # Case 0 — destructive tool queued WITHOUT post_to_slack +
+        # post_approval_request having been called yet this run. The HITL
+        # gate would arm with no Slack visibility for the human reviewer,
+        # leaving them no buttons to click. Strip the destructive tool_calls
+        # from this AIMessage (replace-by-id) and inject a corrective
+        # HumanMessage demanding the model re-issue with Slack first.
+        queued_destructive = [n for n in tool_names if n in self.destructive_tool_names]
+        if queued_destructive:
+            findings_posted = self._tool_called_recently(messages, "post_to_slack")
+            approval_posted = self._tool_called_recently(messages, "post_approval_request")
+            if not (findings_posted and approval_posted):
+                logger.warning(
+                    "KeepLooping: destructive tool(s) %s queued without prior "
+                    "post_to_slack (findings=%s) and post_approval_request "
+                    "(approval=%s) — stripping destructive call(s) and forcing "
+                    "Slack-first re-issue",
+                    queued_destructive, findings_posted, approval_posted,
+                )
+                stripped = self._aimessage_without_tools(last, queued_destructive)
+                missing = []
+                if not findings_posted:
+                    missing.append("post_to_slack (findings summary)")
+                if not approval_posted:
+                    missing.append("post_approval_request (approve/deny buttons)")
+                missing_str = " AND ".join(missing)
+                return {
+                    "messages": [
+                        stripped,
+                        HumanMessage(
+                            content=(
+                                "BLOCKED: you queued a destructive tool "
+                                f"({', '.join(queued_destructive)}) without first "
+                                f"calling {missing_str}. The human reviewer sees ONLY "
+                                "what you send to Slack — the LangGraph approval gate "
+                                "is invisible to them. Re-issue this turn with ALL of "
+                                "the following in a SINGLE response, in this order:\n"
+                                "  1. post_to_slack — full findings summary (root "
+                                "cause, evidence, recommended action, impact).\n"
+                                "  2. post_approval_request — the approve/deny "
+                                "buttons.\n"
+                                "  3. The destructive tool with the exact args you "
+                                "described.\n"
+                                "All three together is fine. Skipping (1) or (2) is "
+                                "the bug to avoid."
+                            )
+                        ),
+                    ],
+                }
+
         # Case 1 — empty tool_calls AND no stand-down text in the message.
         if not tool_calls:
             text = self._extract_text(last)
@@ -263,6 +312,48 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
             return False
         lowered = text.lower()
         return any(phrase in lowered for phrase in STAND_DOWN_PHRASES)
+
+    @staticmethod
+    def _tool_called_recently(messages, tool_name: str) -> bool:
+        """Return True if `tool_name` appears anywhere in the message history
+        as a successfully completed ToolMessage. Used to check whether
+        post_to_slack / post_approval_request has happened this run.
+
+        Note: this scans the entire run history. If a future change adds
+        per-run isolation we'd narrow the scan, but for now any successful
+        prior call within this thread counts."""
+        for m in messages:
+            if isinstance(m, ToolMessage) and getattr(m, "name", "") == tool_name:
+                content = getattr(m, "content", "") or ""
+                if isinstance(content, list):
+                    content = " ".join(
+                        p.get("text", "") if isinstance(p, dict) else str(p)
+                        for p in content
+                    )
+                content_str = str(content)
+                if "Tool error" not in content_str and not content_str.lower().startswith("error"):
+                    return True
+        return False
+
+    @staticmethod
+    def _aimessage_without_tools(msg: AIMessage, names_to_drop: list[str]) -> AIMessage:
+        """Return a copy of `msg` with the named tool_calls removed. Same id,
+        so LangGraph's add_messages reducer replaces the original message in
+        state. The HITL middleware then inspects the rewritten AIMessage and
+        finds no destructive call to interrupt on."""
+        drop_set = set(names_to_drop)
+        kept = [
+            tc for tc in (msg.tool_calls or [])
+            if (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", ""))
+            not in drop_set
+        ]
+        return AIMessage(
+            id=msg.id,
+            content=msg.content,
+            tool_calls=kept,
+            additional_kwargs=getattr(msg, "additional_kwargs", {}) or {},
+            response_metadata=getattr(msg, "response_metadata", {}) or {},
+        )
 
     def _destructive_just_executed(self, messages) -> bool:
         """Return True if the most recent ToolMessage in history was for a

@@ -77,6 +77,21 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT = """
 You are an autonomous Kubernetes operations agent.
 
+APPROVAL GATE PROTOCOL — MANDATORY (read before anything else):
+Before queuing ANY destructive tool (kubectl_delete, kubectl_apply,
+kubectl_patch, kubectl_scale, kubectl_rollout, kubectl_create,
+node_management, etc.), you MUST first call BOTH of these in the same turn
+or in a previous turn of this run:
+  (a) post_to_slack — findings message including root cause + evidence.
+  (b) post_approval_request — action description, impact, approve/deny UI.
+The destructive tool can be in the SAME turn as (a) and (b), but never
+before. The LangGraph interrupt gate is INVISIBLE to humans — Slack is the
+only channel the reviewer sees. Skipping (a) or (b) means the reviewer has
+no idea what you want to do and no way to approve or deny.
+If you skip (a) or (b), the middleware will strip your destructive tool
+call and force you to re-issue with proper Slack messaging — wasting a
+turn. Save the turn: post Slack first.
+
 Cluster context:
 - AGENTS.md and the cluster-specific SKILL.md are already loaded into your
   long-term memory at startup. Refer to them directly — DO NOT call read_file
@@ -329,10 +344,16 @@ def _build_model_with_timeout(model_spec: str):
         )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
+        # Claude defaults to parallel tool use enabled (disable_parallel_tool_use
+        # defaults to False), which is what we need for post_approval_request +
+        # destructive tool to land in the same turn and arm the HITL gate.
+        # max_tokens is required by the Anthropic API; size it for the longest
+        # reasoning chunks the agent emits during multi-step investigation.
         return ChatAnthropic(
             model=model_name,
             timeout=_LLM_TIMEOUT_SEC,
             max_retries=_LLM_MAX_RETRIES,
+            max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "8192")),
         )
     logger.warning(
         "AGENT_MODEL provider %r not in [openai, anthropic] — passing through "

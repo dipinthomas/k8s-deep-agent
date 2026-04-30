@@ -240,10 +240,20 @@ _STREAM_TIMEOUT_SEC = float(os.environ.get("STREAM_TIMEOUT_SEC", "600"))
 _HEARTBEAT_INTERVAL_SEC = float(os.environ.get("HEARTBEAT_INTERVAL_SEC", "60"))
 
 
-def _heartbeat_loop(thread_ts: str, channel: str, stop_event: threading.Event, started_at: float) -> None:
+def _heartbeat_loop(
+    thread_ts: str,
+    channel: str,
+    stop_event: threading.Event,
+    paused_event: threading.Event,
+    started_at: float,
+) -> None:
     """Post a single 'still working' message every HEARTBEAT_INTERVAL_SEC until
-    stop_event is set. Failures here are non-fatal — heartbeats are best-effort."""
+    stop_event is set. Skipped while paused_event is set — the graph is waiting
+    on a human at an interrupt, so 'still investigating' would be misleading.
+    Failures here are non-fatal — heartbeats are best-effort."""
     while not stop_event.wait(_HEARTBEAT_INTERVAL_SEC):
+        if paused_event.is_set():
+            continue
         elapsed = int(time.time() - started_at)
         try:
             slack_app.client.chat_postMessage(
@@ -280,18 +290,23 @@ def stream_agent(payload, thread_ts: str, channel: str) -> None:
     # the user would never see anything — we post the text ourselves as a
     # fallback so heartbeat-only stalls become impossible.
     posted_to_slack = {"value": False}
+    paused_hb = threading.Event()
 
     async def _run():
         async def _drive():
             async for chunk in agent.astream(input_payload, config):
                 logger.debug("Agent chunk: %s", chunk)
                 _scan_chunk_for_slack_posts(chunk, posted_to_slack)
+                if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                    paused_hb.set()
         await asyncio.wait_for(_drive(), timeout=_STREAM_TIMEOUT_SEC)
 
     started = time.time()
     stop_hb = threading.Event()
     hb_thread = threading.Thread(
-        target=_heartbeat_loop, args=(thread_ts, channel, stop_hb, started), daemon=True,
+        target=_heartbeat_loop,
+        args=(thread_ts, channel, stop_hb, paused_hb, started),
+        daemon=True,
     )
     hb_thread.start()
     try:
@@ -470,11 +485,21 @@ def _log_last_ai_tool_calls(state, why: str) -> None:
         logger.exception("Failed to introspect last AIMessage")
 
 
-def _resume_command(decision_type: str, thread_ts: str, channel: str) -> Command:
+def _resume_command(
+    decision_type: str,
+    thread_ts: str,
+    channel: str,
+    respond_message: str | None = None,
+) -> Command:
     """Build a Command(resume={"decisions": [...]}) with EXACTLY as many
     decisions as the pending interrupt requested action_requests for. The
     HumanInTheLoopMiddleware ValueError-rejects any mismatch, so getting this
-    count right is non-negotiable."""
+    count right is non-negotiable.
+
+    decision_type: "approve" | "reject" | "respond". For "respond" the gate
+    stays armed (the queued destructive tool is NOT consumed); the message is
+    delivered to the model as the human's reply so it can answer Q&A and then
+    we re-post the buttons to let the user decide for real."""
     n = _pending_interrupt_action_count(thread_ts, channel)
     if n == 0:
         # No pending interrupt — sending decisions=[] is the cleanest no-op
@@ -486,7 +511,10 @@ def _resume_command(decision_type: str, thread_ts: str, channel: str) -> Command
         )
         return Command(resume={"decisions": []})
 
-    decisions = [{"type": decision_type} for _ in range(n)]
+    if decision_type == "respond":
+        decisions = [{"type": "respond", "args": respond_message or ""} for _ in range(n)]
+    else:
+        decisions = [{"type": decision_type} for _ in range(n)]
     logger.info("Resuming thread_ts=%s with %d %s decision(s)", thread_ts, n, decision_type)
     return Command(resume={"decisions": decisions})
 
@@ -718,12 +746,18 @@ def _register_slack_handlers() -> None:
 
         threading.Thread(target=_resume, daemon=True).start()
 
-    # MORE_DETAILS → user-visible ack first, then a Q&A turn. We must not start a
-    # fresh stream while an interrupt is pending — that re-trips the gate and the
-    # explanation never gets posted. Instead: if pending, reject the queued tool
-    # call(s) so the graph cleanly returns control to the model, then ask the
-    # follow-up question. The agent will explain and re-propose if it still wants
-    # the action, re-firing the gate (and giving the user fresh buttons).
+    # MORE_DETAILS → resume the interrupt with decision="respond". This is the
+    # LangGraph HITL pattern for asking a follow-up: the queued destructive tool
+    # is NOT consumed (gate stays effectively pending — see below), and the
+    # supplied message is delivered to the model as the human's reply. The model
+    # explains, then is expected to re-propose the action, which re-arms the
+    # gate. We re-post the approval block so a fresh APPROVE/DENY pair is
+    # visible to the user.
+    #
+    # Critical distinction from the previous (buggy) implementation:
+    # we do NOT use decision="reject" here. "reject" tells the model the human
+    # denied the action — the system prompt then mandates mark_stand_down, which
+    # terminated the graph and made the subsequent APPROVE click a no-op.
     @slack_app.action("agent_more_details")
     def handle_more_details(ack, body, say):
         ack()
@@ -734,23 +768,36 @@ def _register_slack_handlers() -> None:
 
         def _details():
             try:
-                # If the graph is paused at a gate, clear the interrupt by
-                # rejecting the queued tool call(s) before asking for explanation.
-                # Otherwise astream() would resume into the same gate and re-pause.
                 if _pending_interrupt_action_count(thread_ts, channel) > 0:
                     stream_agent(
-                        _resume_command("reject", thread_ts, channel),
+                        _resume_command(
+                            "respond",
+                            thread_ts,
+                            channel,
+                            respond_message=(
+                                "The reviewer clicked MORE DETAILS. Provide a "
+                                "deeper explanation of the evidence and the "
+                                "recommendation. Do NOT call mark_stand_down — "
+                                "the human has not denied the action. After "
+                                "explaining, re-propose the same destructive "
+                                "tool call so the gate re-arms for approval."
+                            ),
+                        ),
                         thread_ts,
                         channel,
                     )
-                stream_agent(
-                    [{"role": "user", "content":
-                        "Provide more detail about your findings — do not "
-                        "execute any tool yet, just explain. After explaining, "
-                        "re-propose the recommended action so I can decide."}],
-                    thread_ts,
-                    channel,
-                )
+                else:
+                    # No pending interrupt — graph already exited. Run a fresh
+                    # turn asking for explanation; the model can re-propose if
+                    # it still considers the action warranted.
+                    stream_agent(
+                        [{"role": "user", "content":
+                            "Provide more detail about your findings — do not "
+                            "execute any tool yet, just explain. After explaining, "
+                            "re-propose the recommended action so I can decide."}],
+                        thread_ts,
+                        channel,
+                    )
                 post_approval_block(channel, thread_ts)
             except Exception:
                 # stream_agent already posted the failure to the thread.
