@@ -82,6 +82,10 @@ spec:
     metadata:
       labels:
         app: k8s-mcp-gateway
+      annotations:
+        # Karpenter consolidation was evicting this pod under "Underutilized".
+        # Block disruption so the gateway stays available to the agent.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       serviceAccountName: k8s-mcp-gateway
       containers:

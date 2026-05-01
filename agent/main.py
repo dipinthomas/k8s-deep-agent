@@ -404,6 +404,93 @@ def _safety_net_post_final_message(thread_ts: str, channel: str) -> None:
         logger.exception("Safety-net: failed to post final message")
 
 
+def _context_only_answer(thread_ts: str, channel: str, question: str) -> str:
+    """Answer a reviewer question using ONLY the investigation messages already
+    in the checkpointer. No tools are bound to the model — the call is a flat
+    text completion against the current state, so no kubectl / cloudwatch
+    queries can fire. The Slack reply makes this restriction explicit so the
+    reviewer knows they're getting a recap, not fresh evidence."""
+    from agent import _build_model_with_timeout
+    from langchain_core.messages import (
+        AIMessage, HumanMessage, SystemMessage, ToolMessage,
+    )
+
+    config = agent_config(thread_ts, channel)
+
+    async def _get_state():
+        return await agent.aget_state(config)
+
+    state = run_async(_get_state()).result()
+    values = getattr(state, "values", None) or {}
+    messages = values.get("messages") if isinstance(values, dict) else None
+
+    transcript_lines: list[str] = []
+    if messages:
+        for m in messages:
+            kind = type(m).__name__
+            raw = getattr(m, "content", "")
+            if isinstance(raw, list):
+                text = "\n".join(p.get("text", "") for p in raw if isinstance(p, dict))
+            else:
+                text = str(raw or "")
+            text = text.strip()
+            if not text:
+                continue
+            if kind in ("HumanMessage",):
+                transcript_lines.append(f"[user] {text}")
+            elif kind in ("AIMessage", "AIMessageChunk"):
+                tcs = getattr(m, "tool_calls", None) or []
+                if tcs:
+                    tc_summary = ", ".join(tc.get("name", "?") for tc in tcs)
+                    transcript_lines.append(f"[agent → tools: {tc_summary}] {text}")
+                else:
+                    transcript_lines.append(f"[agent] {text}")
+            elif kind == "ToolMessage":
+                name = getattr(m, "name", "tool")
+                # Tool outputs can be huge — cap each one so the prompt stays
+                # bounded. The agent's own reasoning above already distilled
+                # the relevant bits.
+                if len(text) > 1500:
+                    text = text[:1500] + "…[truncated]"
+                transcript_lines.append(f"[tool:{name}] {text}")
+            else:
+                transcript_lines.append(f"[{kind}] {text}")
+
+    transcript = "\n".join(transcript_lines) or "(no investigation messages found)"
+
+    model_spec = os.environ.get("AGENT_MODEL", "openai:gpt-5-mini")
+    model = _build_model_with_timeout(model_spec)
+
+    prompt_messages = [
+        SystemMessage(content=(
+            "You are answering a follow-up question about an in-progress "
+            "Kubernetes incident investigation. RULES:\n"
+            "1. Use ONLY the investigation transcript provided below — do not "
+            "invent facts or speculate beyond what the agent has already observed.\n"
+            "2. You CANNOT call tools, query Kubernetes, or fetch metrics. If "
+            "the question requires fresh data, say so plainly and recommend "
+            "the reviewer run the relevant kubectl / CloudWatch query themselves "
+            "(or DENY and let the agent re-investigate).\n"
+            "3. Be concise: 4–8 sentences unless the question genuinely needs more.\n"
+            "4. Quote specific values from the transcript (pod names, metrics, "
+            "timestamps) so the reviewer can trace your answer back to the evidence.\n"
+        )),
+        HumanMessage(content=(
+            f"Investigation transcript:\n---\n{transcript}\n---\n\n"
+            f"Reviewer's question: {question}"
+        )),
+    ]
+
+    async def _invoke():
+        return await model.ainvoke(prompt_messages)
+
+    response = run_async(_invoke()).result()
+    raw = getattr(response, "content", "")
+    if isinstance(raw, list):
+        return "\n".join(p.get("text", "") for p in raw if isinstance(p, dict)).strip()
+    return str(raw or "").strip() or "(model returned no text)"
+
+
 def _pending_interrupt_action_count(thread_ts: str, channel: str) -> int:
     """Return the number of action_requests inside the pending HITL interrupt.
 
@@ -746,64 +833,117 @@ def _register_slack_handlers() -> None:
 
         threading.Thread(target=_resume, daemon=True).start()
 
-    # MORE_DETAILS → resume the interrupt with decision="respond". This is the
-    # LangGraph HITL pattern for asking a follow-up: the queued destructive tool
-    # is NOT consumed (gate stays effectively pending — see below), and the
-    # supplied message is delivered to the model as the human's reply. The model
-    # explains, then is expected to re-propose the action, which re-arms the
-    # gate. We re-post the approval block so a fresh APPROVE/DENY pair is
-    # visible to the user.
+    # MORE_DETAILS → open a modal that takes a free-text question from the
+    # reviewer. We DO NOT resume the graph here. The pending interrupt stays
+    # armed so APPROVE / DENY remain valid.
     #
-    # Critical distinction from the previous (buggy) implementation:
-    # we do NOT use decision="reject" here. "reject" tells the model the human
-    # denied the action — the system prompt then mandates mark_stand_down, which
-    # terminated the graph and made the subsequent APPROVE click a no-op.
+    # Why not resume with decision="respond": the upstream
+    # HumanInTheLoopMiddleware._process_decision only handles approve/edit/reject
+    # and ValueError-rejects "respond" even when it appears in allowed_decisions
+    # — so a "respond" resume immediately wedges the thread.
+    #
+    # Q&A is therefore intentionally context-only: a one-shot LLM call against
+    # the investigation messages already in the checkpointer. No new kubectl /
+    # cloudwatch tool calls are issued. The thread reply makes that limitation
+    # explicit so the reviewer knows they're getting a recap, not fresh data.
     @slack_app.action("agent_more_details")
-    def handle_more_details(ack, body, say):
+    def handle_more_details(ack, body):
         ack()
         thread_ts = body["container"].get("thread_ts") or body["container"]["message_ts"]
         channel = body["channel"]["id"]
+        trigger_id = body["trigger_id"]
 
-        say(text="🔍 Pulling more detail…", thread_ts=thread_ts, channel=channel)
+        try:
+            slack_app.client.views_open(
+                trigger_id=trigger_id,
+                view={
+                    "type": "modal",
+                    "callback_id": "agent_more_details_modal",
+                    "private_metadata": json.dumps({"thread_ts": thread_ts, "channel": channel}),
+                    "title": {"type": "plain_text", "text": "Ask the agent"},
+                    "submit": {"type": "plain_text", "text": "Ask"},
+                    "close": {"type": "plain_text", "text": "Cancel"},
+                    "blocks": [
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    ":information_source: *Context-only Q&A.* The agent will "
+                                    "answer using the investigation history already in memory. "
+                                    "It will *not* run new kubectl or CloudWatch queries. "
+                                    "APPROVE / DENY remain available on the original card."
+                                ),
+                            },
+                        },
+                        {
+                            "type": "input",
+                            "block_id": "question_block",
+                            "label": {"type": "plain_text", "text": "Your question"},
+                            "element": {
+                                "type": "plain_text_input",
+                                "action_id": "question_input",
+                                "multiline": True,
+                                "placeholder": {
+                                    "type": "plain_text",
+                                    "text": "e.g. What evidence rules out the redis pod as the cause?",
+                                },
+                            },
+                        },
+                    ],
+                },
+            )
+        except Exception:
+            logger.exception("Failed to open MORE DETAILS modal")
+            slack_app.client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=":warning: Could not open the question dialog. Try again or use APPROVE / DENY.",
+            )
 
-        def _details():
+    @slack_app.view("agent_more_details_modal")
+    def handle_more_details_submit(ack, body):
+        ack()
+        meta = json.loads(body["view"]["private_metadata"])
+        thread_ts = meta["thread_ts"]
+        channel = meta["channel"]
+        question = (
+            body["view"]["state"]["values"]["question_block"]["question_input"]["value"] or ""
+        ).strip()
+
+        if not question:
+            return
+
+        def _answer():
             try:
-                if _pending_interrupt_action_count(thread_ts, channel) > 0:
-                    stream_agent(
-                        _resume_command(
-                            "respond",
-                            thread_ts,
-                            channel,
-                            respond_message=(
-                                "The reviewer clicked MORE DETAILS. Provide a "
-                                "deeper explanation of the evidence and the "
-                                "recommendation. Do NOT call mark_stand_down — "
-                                "the human has not denied the action. After "
-                                "explaining, re-propose the same destructive "
-                                "tool call so the gate re-arms for approval."
-                            ),
-                        ),
-                        thread_ts,
-                        channel,
-                    )
-                else:
-                    # No pending interrupt — graph already exited. Run a fresh
-                    # turn asking for explanation; the model can re-propose if
-                    # it still considers the action warranted.
-                    stream_agent(
-                        [{"role": "user", "content":
-                            "Provide more detail about your findings — do not "
-                            "execute any tool yet, just explain. After explaining, "
-                            "re-propose the recommended action so I can decide."}],
-                        thread_ts,
-                        channel,
-                    )
+                # Echo the question to the thread so the conversation is legible
+                # to anyone reading along.
+                slack_app.client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f":speech_balloon: *Reviewer asked:* {question}",
+                )
+
+                answer = _context_only_answer(thread_ts, channel, question)
+
+                slack_app.client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=(
+                        ":robot_face: *Context-only answer* "
+                        "(no new tool calls were made):\n\n" + answer
+                    ),
+                )
                 post_approval_block(channel, thread_ts)
             except Exception:
-                # stream_agent already posted the failure to the thread.
-                logger.exception("More-details handling failed")
+                logger.exception("More-details Q&A failed")
+                slack_app.client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=":warning: Could not generate a context-only answer. APPROVE / DENY are still available.",
+                )
 
-        threading.Thread(target=_details, daemon=True).start()
+        threading.Thread(target=_answer, daemon=True).start()
 
 
 def _serve_http() -> None:

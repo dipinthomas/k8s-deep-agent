@@ -75,7 +75,9 @@ spec:
     - operator: Exists
   containers:
     - name: stress
-      image: polinux/stress-ng
+      # Multi-arch (amd64 + arm64). polinux/stress-ng is amd64-only and
+      # fails with "exec format error" on Graviton/arm64 nodes.
+      image: ghcr.io/colinianking/stress-ng
       # One worker per vCPU at CPU_PCT load each = ~CPU_PCT% node CPU.
       # No --timeout: runs until the pod is deleted (reset script handles cleanup).
       args: ["--cpu", "${STRESS_WORKERS}", "--cpu-load", "${CPU_PCT}"]

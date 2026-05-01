@@ -5,6 +5,7 @@
 # Usage:
 #   bash infra/trigger-agent-direct.sh                       # ALARM (disk pressure scenario)
 #   bash infra/trigger-agent-direct.sh cpu                   # ALARM (noisy-neighbor / CPU scenario)
+#   bash infra/trigger-agent-direct.sh pods                  # ALARM (investigate all not-Running pods)
 #   bash infra/trigger-agent-direct.sh ok                    # OK (resolved)
 #   bash infra/trigger-agent-direct.sh <url>                 # override LB URL (still uses disk scenario)
 #   bash infra/trigger-agent-direct.sh cpu --node i-abc123   # explicit node override
@@ -57,14 +58,21 @@ if [[ -z "$CHECKOUT_NODE" ]]; then
 fi
 
 if [[ -z "$CHECKOUT_NODE" ]]; then
-  CHECKOUT_NODE=$(kubectl get nodes \
-    -o jsonpath='{range .items[?(@.status.conditions[-1].type=="Ready")]}{.metadata.name}{"\n"}{end}' \
-    2>/dev/null | head -1)
+  # Fallback: first node currently reporting Ready in `kubectl get nodes`.
+  # The jsonpath conditions[-1] form is fragile (depends on condition order),
+  # so use the kubectl-rendered STATUS column instead.
+  CHECKOUT_NODE=$(kubectl get nodes --no-headers 2>/dev/null \
+    | awk '$2=="Ready"{print $1; exit}')
 fi
 
 if [[ -z "$CHECKOUT_NODE" ]]; then
-  echo "Error: could not resolve a node. Pass --node <name> explicitly." >&2
-  exit 1
+  if [[ "$SCENARIO" == "pods" || "$SCENARIO" == "PODS" ]]; then
+    # Pods scenario is cluster-wide — node is informational only.
+    CHECKOUT_NODE="cluster-wide"
+  else
+    echo "Error: could not resolve a node. Pass --node <name> explicitly." >&2
+    exit 1
+  fi
 fi
 
 if [[ "$SCENARIO" == "ok" || "$SCENARIO" == "OK" ]]; then
@@ -74,8 +82,66 @@ if [[ "$SCENARIO" == "ok" || "$SCENARIO" == "OK" ]]; then
 
 elif [[ "$SCENARIO" == "cpu" || "$SCENARIO" == "CPU" ]]; then
   PAYLOAD_STATE="ALARM"
-  ALARM_NAME="EKS-NodeCPUHigh-otel-demo-prod"
-  REASON="Node CPU utilisation at 81% (threshold: 75%). Application service p99 latency rising: 145ms -> 620ms. Unidentified workload consuming ${NODE_CPU:-8} cores on node."
+  ALARM_NAME="Application Latency"
+  REASON="Application service p99 latency rising: 145ms -> 620ms."
+
+elif [[ "$SCENARIO" == "pods" || "$SCENARIO" == "PODS" ]]; then
+  PAYLOAD_STATE="ALARM"
+  ALARM_NAME="EKS-PodsNotRunning-otel-demo-prod"
+
+  # Snapshot every pod cluster-wide that is NOT healthy. "Not healthy" =
+  # phase is anything other than Running/Succeeded, OR phase is Running but a
+  # container is not Ready (catches CrashLoopBackOff, ImagePullBackOff, etc.).
+  # One pod per line: <namespace>/<name>  phase=<phase>  reason=<reason>  restarts=<n>
+  NOT_RUNNING=$(kubectl get pods --all-namespaces -o json 2>/dev/null | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+for p in data["items"]:
+    phase = p["status"].get("phase", "")
+    if phase == "Succeeded":
+        continue
+    cs_list = p["status"].get("containerStatuses") or []
+    if phase == "Running" and cs_list and all(c.get("ready") for c in cs_list):
+        continue
+    ns = p["metadata"]["namespace"]
+    name = p["metadata"]["name"]
+    bad = next((c for c in cs_list if not c.get("ready")), cs_list[0] if cs_list else None)
+    reason, restarts = "", 0
+    if bad:
+        st = bad.get("state", {})
+        reason = ((st.get("waiting") or {}).get("reason")
+                  or (st.get("terminated") or {}).get("reason") or "")
+        restarts = bad.get("restartCount", 0)
+    if not cs_list:
+        for cond in p["status"].get("conditions", []) or []:
+            if cond.get("type") == "PodScheduled" and cond.get("status") != "True":
+                reason = cond.get("reason", "Unschedulable")
+                break
+    print(f"{ns}/{name}\tphase={phase}\treason={reason}\trestarts={restarts}")
+' || true)
+
+  if [[ -z "$NOT_RUNNING" ]]; then
+    echo "No pods in a non-Running / non-Succeeded state. Nothing to investigate."
+    exit 0
+  fi
+
+  POD_COUNT=$(printf '%s\n' "$NOT_RUNNING" | wc -l | tr -d ' ')
+
+  # Embed the list verbatim in the reason. JSON-escape via python so newlines /
+  # quotes survive the curl payload below.
+  REASON=$(POD_LIST="$NOT_RUNNING" POD_COUNT="$POD_COUNT" python3 -c '
+import json, os
+pods = os.environ["POD_LIST"].rstrip()
+count = os.environ["POD_COUNT"]
+msg = (
+    f"{count} pod(s) are not in Running state cluster-wide. "
+    "Investigate each one: identify why it is failing, group by root cause "
+    "(image pull errors, crash loops, scheduling failures, OOM, etc.), and "
+    "recommend remediation. Do not take destructive action without approval.\n\n"
+    f"Failing pods:\n{pods}"
+)
+print(json.dumps(msg)[1:-1])  # strip the wrapping quotes, keep escapes
+')
 
 else
   # Default: disk pressure scenario

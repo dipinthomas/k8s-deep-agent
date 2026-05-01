@@ -12,6 +12,11 @@ spec:
     metadata:
       labels:
         app: agent-redis
+      annotations:
+        # Karpenter consolidation evicts this pod mid-investigation, which
+        # drops the LangGraph checkpointer state held in the emptyDir volume.
+        # Block disruption so Redis stays put while the agent is running.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
       containers:
       - name: redis
