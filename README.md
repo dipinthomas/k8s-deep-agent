@@ -48,7 +48,7 @@ flowchart TD
     end
 
     subgraph AGENT["🤖 AI Agent (deepagents + LangGraph)"]
-        MASTER["Master Agent\nClaude claude-sonnet-4-6\nreads AGENTS.md + skills/"]
+        MASTER["Master Agent\nOpenAI gpt-5-mini\nreads AGENTS.md + skills/"]
         subgraph SUBAGENTS["Parallel Subagents"]
             SA1["cloudwatch-investigator\ndisk metrics + logs"]
             SA2["kubectl-investigator\nnode conditions + pod status"]

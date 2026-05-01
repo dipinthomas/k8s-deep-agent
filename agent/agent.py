@@ -175,7 +175,14 @@ def _build_interrupt_on(mcp_tools: list) -> dict:
         desc_match = any(kw in desc_lower for kw in _DESTRUCTIVE_DESC_KEYWORDS)
 
         if name_match or desc_match:
-            interrupt_on[tool.name] = True
+            # Explicit allowed_decisions list (instead of `True`) so the
+            # MORE DETAILS Slack button can resume with decision="respond".
+            # The shorthand `True` only enables ["approve", "edit", "reject"];
+            # without "respond" the HITL middleware ValueError-rejects the
+            # follow-up Q&A flow.
+            interrupt_on[tool.name] = {
+                "allowed_decisions": ["approve", "edit", "reject", "respond"]
+            }
 
     return interrupt_on
 
@@ -330,7 +337,7 @@ async def build_agent_async():
         )
 
     model = _build_model_with_timeout(
-        os.environ.get("AGENT_MODEL", "anthropic:claude-sonnet-4-6")
+        os.environ.get("AGENT_MODEL", "openai:gpt-5-mini")
     )
 
     agent = create_deep_agent(

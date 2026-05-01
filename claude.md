@@ -294,9 +294,9 @@ AWS_REGION=...               # Region the cluster runs in
 AWS_PROFILE=...              # Profile with EKS + CloudWatch read access
 
 # LLM
-AGENT_MODEL=anthropic:claude-sonnet-4-6   # provider:model — openai:* or anthropic:* supported
-ANTHROPIC_API_KEY=...                     # if AGENT_MODEL is anthropic:*
+AGENT_MODEL=openai:gpt-5-mini             # provider:model — openai:* or anthropic:* supported
 OPENAI_API_KEY=...                        # if AGENT_MODEL is openai:*
+ANTHROPIC_API_KEY=...                     # if AGENT_MODEL is anthropic:*
 
 # Slack
 SLACK_BOT_TOKEN=xoxb-...
