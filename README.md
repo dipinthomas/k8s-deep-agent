@@ -113,7 +113,7 @@ The whole AWS stack is managed by three CloudFormation templates under
 
 ```bash
 cp infra/agent-secrets.example.yaml infra/agent-secrets.yaml
-# Edit infra/agent-secrets.yaml — fill in OPENAI_API_KEY, SLACK_*, etc.
+# Edit infra/agent-secrets.yaml — fill in ANTHROPIC_API_KEY, SLACK_*, etc.
 ```
 
 ### 2. Deploy the stack

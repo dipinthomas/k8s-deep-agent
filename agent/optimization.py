@@ -1,0 +1,212 @@
+"""
+Token-cost optimization middleware and helpers.
+
+Three concerns live here, all aimed at cutting input-token spend without
+touching the agent graph, interrupt machinery, or KeepLoopingMiddleware:
+
+1. TokenUsageLoggingMiddleware — wraps every model call and logs Anthropic
+   usage_metadata (input / output / cache_read / cache_creation) so we can
+   see cache hit rates and verify other optimisations actually save tokens.
+
+2. ToolOutputTruncator — truncates oversized MCP tool outputs at the wrapper
+   layer. Raw kubectl output (`get pods -A -o wide`) and CloudWatch
+   responses can be 10–50 KB; the LLM rarely needs more than the first few
+   KB. We keep head + tail with a marker in the middle so the model still
+   sees structure but stops paying for replays of full dumps every turn.
+
+3. filter_mcp_tools_for_subagent() — given the full MCP tool list and a
+   subagent role, return only the tools that subagent actually needs. The
+   cloudwatch-investigator does not need kubectl tools and vice versa;
+   filtering cuts ~30k tokens of schema overhead per subagent invocation.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    ModelCallResult,
+    ModelRequest,
+    ModelResponse,
+)
+from langchain_core.messages import AIMessage
+
+logger = logging.getLogger(__name__)
+
+
+# ── 1. Token-usage logging ────────────────────────────────────────────────────
+
+class TokenUsageLoggingMiddleware(AgentMiddleware):
+    """Log every model call's token usage at INFO so cache hit rate and
+    per-turn input-token spend are visible.
+
+    Anthropic's usage_metadata exposes:
+      - input_tokens         (excluding cached prefix reads)
+      - output_tokens
+      - input_token_details.cache_read       (read from the prefix cache)
+      - input_token_details.cache_creation   (newly written to the cache)
+
+    A healthy steady-state investigation should show input_tokens shrink to
+    a small number while cache_read grows large. If cache_read stays at 0,
+    something invalidated the prefix between turns (often: the system
+    prompt or tools list changed shape).
+    """
+
+    name = "TokenUsageLoggingMiddleware"
+
+    def __init__(self, label: str = "agent") -> None:
+        super().__init__()
+        self.label = label
+
+    def _log(self, response: ModelResponse) -> None:
+        try:
+            messages = getattr(response, "result", None) or []
+            for msg in messages:
+                if not isinstance(msg, AIMessage):
+                    continue
+                usage = getattr(msg, "usage_metadata", None) or {}
+                if not usage:
+                    continue
+                input_t = usage.get("input_tokens", 0) or 0
+                output_t = usage.get("output_tokens", 0) or 0
+                details = usage.get("input_token_details") or {}
+                cache_read = details.get("cache_read") or 0
+                cache_creation = details.get("cache_creation") or 0
+                # cache hit ratio relative to the full prompt the model saw
+                full_input = input_t + cache_read + cache_creation
+                hit_pct = (cache_read / full_input * 100) if full_input else 0.0
+                logger.info(
+                    "TOKENS[%s] in=%d out=%d cache_read=%d cache_create=%d "
+                    "full_in=%d cache_hit=%.0f%%",
+                    self.label, input_t, output_t, cache_read, cache_creation,
+                    full_input, hit_pct,
+                )
+        except Exception:
+            # Logging must never break the model loop.
+            logger.debug("TokenUsageLoggingMiddleware logging failed", exc_info=True)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], ModelResponse],
+    ) -> ModelCallResult:
+        response = handler(request)
+        self._log(response)
+        return response
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelCallResult:
+        response = await handler(request)
+        self._log(response)
+        return response
+
+
+# ── 2. Tool-output truncation ─────────────────────────────────────────────────
+
+# Default budget per tool result in characters (~tokens × 4). Keeping
+# head + tail of a payload preserves structural cues (column headers at the
+# top, totals at the bottom) which is usually all the model needs.
+_DEFAULT_TOOL_OUTPUT_CHAR_LIMIT = int(
+    os.environ.get("TOOL_OUTPUT_CHAR_LIMIT", "8000")
+)
+_TRUNCATION_HEAD_FRAC = 0.6
+_TRUNCATION_MARKER_TMPL = (
+    "\n\n…[truncated {dropped} characters of {total} — "
+    "ask for narrower output if you need the middle]…\n\n"
+)
+
+
+def truncate_tool_output(
+    text: str, char_limit: int = _DEFAULT_TOOL_OUTPUT_CHAR_LIMIT
+) -> str:
+    """Truncate `text` to roughly `char_limit` characters by keeping a head
+    and tail slice with a marker between them. Returns text unchanged if
+    already under the limit."""
+    if not isinstance(text, str):
+        return text
+    if len(text) <= char_limit:
+        return text
+    head_len = int(char_limit * _TRUNCATION_HEAD_FRAC)
+    tail_len = max(0, char_limit - head_len - 200)  # leave room for marker
+    head = text[:head_len]
+    tail = text[-tail_len:] if tail_len > 0 else ""
+    marker = _TRUNCATION_MARKER_TMPL.format(
+        dropped=len(text) - head_len - tail_len, total=len(text)
+    )
+    return f"{head}{marker}{tail}"
+
+
+# ── 3. Per-subagent MCP tool filtering ────────────────────────────────────────
+
+# Keyword patterns that classify a tool as belonging to a logical domain.
+# Match is by lowercase substring on tool name + description. We err on the
+# side of inclusion; missing a tool is worse than carrying an extra one.
+_KUBECTL_KEYWORDS = (
+    "kubectl", "kube_", "k8s_", "pod", "namespace", "node",
+    "deployment", "service", "ingress", "statefulset", "daemonset",
+    "configmap", "secret", "rbac", "scale", "rollout", "drain", "evict",
+)
+_CLOUDWATCH_KEYWORDS = (
+    "cloudwatch", "metric", "alarm", "log", "logs_insight",
+    "container_insight", "describe_alarm", "get_metric",
+)
+_OTEL_KEYWORDS = _CLOUDWATCH_KEYWORDS  # OTel data flows through CloudWatch
+
+
+def _tool_matches(tool: Any, keywords: tuple[str, ...]) -> bool:
+    name = (getattr(tool, "name", "") or "").lower()
+    desc = (getattr(tool, "description", "") or "").lower()
+    return any(kw in name or kw in desc for kw in keywords)
+
+
+def filter_mcp_tools_for_subagent(
+    mcp_tools: list[Any], role: str
+) -> list[Any]:
+    """Filter the full MCP tool list down to the subset a subagent needs.
+
+    role:
+      - "kubectl"     → kubectl-mcp tools only
+      - "cloudwatch"  → cloudwatch-mcp tools only
+      - "otel"        → cloudwatch tools (OTel data is in CloudWatch)
+      - anything else → returns the full list unchanged
+
+    The master agent always gets the full list. This filter is for
+    subagents only.
+    """
+    if not mcp_tools:
+        return mcp_tools
+
+    keywords: tuple[str, ...] | None
+    if role == "kubectl":
+        keywords = _KUBECTL_KEYWORDS
+    elif role == "cloudwatch":
+        keywords = _CLOUDWATCH_KEYWORDS
+    elif role == "otel":
+        keywords = _OTEL_KEYWORDS
+    else:
+        return mcp_tools
+
+    filtered = [t for t in mcp_tools if _tool_matches(t, keywords)]
+    dropped = len(mcp_tools) - len(filtered)
+    logger.info(
+        "Subagent[%s] tool filter: kept %d / %d MCP tools (dropped %d)",
+        role, len(filtered), len(mcp_tools), dropped,
+    )
+    # Defensive: if the filter accidentally drops everything (e.g. tool
+    # naming scheme changed), fall back to the full list rather than
+    # ship a subagent with no tools.
+    if not filtered:
+        logger.warning(
+            "Subagent[%s] tool filter returned 0 tools — falling back to "
+            "full MCP tool list. Update keyword patterns in optimization.py.",
+            role,
+        )
+        return mcp_tools
+    return filtered

@@ -66,11 +66,12 @@ configured via `SLACK_CHANNEL_ID`. Tag the on-call contact configured via
 When proposing a remediation:
 
 - **Prefer targeted `kubectl_delete pod <name> -n <namespace>`** over node-level
-  operations like `node_management` drain or cordon. The demo cluster contains
-  bare pods, DaemonSets, and emptyDir volumes that cause drain to fail with
-  unfixable obstacles ("cannot evict pod ... has emptyDir", "DaemonSet-managed").
-  Deleting individual non-critical pods is simpler, succeeds reliably, and gives
-  finer-grained control over which workloads are sacrificed.
+  operations like `node_management` drain or cordon. Real clusters commonly
+  contain bare pods, DaemonSets, and emptyDir volumes that cause drain to fail
+  with unfixable obstacles ("cannot evict pod ... has emptyDir",
+  "DaemonSet-managed"). Deleting individual non-critical pods is simpler,
+  succeeds reliably, and gives finer-grained control over which workloads are
+  sacrificed.
 - Build the action list as a sequence of `kubectl_delete pod` calls (lowest
   priority first), not as one big drain.
 - Reserve drain/cordon for genuine node-level failures (hardware faults, node

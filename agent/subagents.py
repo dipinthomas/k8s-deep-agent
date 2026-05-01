@@ -2,11 +2,33 @@
 Subagent definitions for parallel incident investigation.
 
 Each subagent owns a domain (CloudWatch metrics, K8s cluster state, OTel traces).
-They receive the full MCP tool list and use their role + skills to decide what to
-query — no hardcoded investigation steps. Scenario-specific playbooks live in skills/.
+Each subagent receives ONLY the MCP tool subset its role needs (filtered by
+optimization.filter_mcp_tools_for_subagent) — sending all ~50 MCP tool schemas
+to every subagent costs ~30k input tokens per subagent invocation that we
+don't need to spend.
+
+Each subagent is also capped by ModelCallLimitMiddleware so a tool-error loop
+inside a subagent can't burn unbounded tokens. The cap (default 6 model calls
+per run) is generous for normal investigation but breaks runaway loops.
+
+Scenario-specific playbooks live in skills/.
 """
 
+import os
 from typing import Any
+
+from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
+
+from optimization import (
+    TokenUsageLoggingMiddleware,
+    filter_mcp_tools_for_subagent,
+)
+
+# Per-run model-call cap inside a subagent. Default is generous; lower it if
+# subagent runs are still spending too many tokens, raise it if legitimate
+# investigations are getting cut off.
+_SUBAGENT_RUN_LIMIT = int(os.environ.get("SUBAGENT_MODEL_CALL_LIMIT", "6"))
+
 
 _RETURN_CONTRACT = (
     "Return your findings as a structured markdown report using exactly these sections:\n"
@@ -24,10 +46,24 @@ _RETURN_CONTRACT = (
 )
 
 
+def _subagent_middleware(label: str) -> list[Any]:
+    """Per-subagent middleware: token-usage logging + run-level call cap.
+
+    Both layers are independent of the master agent's KeepLoopingMiddleware
+    (which only runs at the master level) and the auto-wired
+    AnthropicPromptCachingMiddleware (which deepagents already adds).
+    """
+    return [
+        TokenUsageLoggingMiddleware(label=label),
+        ModelCallLimitMiddleware(run_limit=_SUBAGENT_RUN_LIMIT, exit_behavior="end"),
+    ]
+
+
 def build_subagents(mcp_tools: list[Any]) -> list[dict]:
     """
     Build the three subagent definitions, injecting the MCP tools loaded
-    at startup. Called once from agent.py during agent construction.
+    at startup. Each subagent receives a filtered tool subset matching its
+    role. Called once from agent.py during agent construction.
     """
 
     cloudwatch_subagent = {
@@ -54,7 +90,8 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "- Explicit call-out if any metric is within normal range (absence of evidence matters)\n\n"
             + _RETURN_CONTRACT
         ),
-        "tools": mcp_tools,
+        "tools": filter_mcp_tools_for_subagent(mcp_tools, "cloudwatch"),
+        "middleware": _subagent_middleware("subagent.cloudwatch"),
         "skills": [],
     }
 
@@ -82,7 +119,8 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "- Any pods in non-Running phase (Pending, Evicted, OOMKilled, CrashLoopBackOff)\n\n"
             + _RETURN_CONTRACT
         ),
-        "tools": mcp_tools,
+        "tools": filter_mcp_tools_for_subagent(mcp_tools, "kubectl"),
+        "middleware": _subagent_middleware("subagent.kubectl"),
         "skills": [
             "./skills/universal/node-disk-pressure/",
             "./skills/universal/pod-priority-eviction/",
@@ -116,9 +154,10 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "- A one-line user impact summary the master agent can quote in Slack\n\n"
             + _RETURN_CONTRACT
         ),
-        "tools": mcp_tools,
+        "tools": filter_mcp_tools_for_subagent(mcp_tools, "otel"),
+        "middleware": _subagent_middleware("subagent.otel"),
         "skills": [
-            "./skills/universal/checkout-protection/",
+            "./skills/universal/critical-service-protection/",
         ],
     }
 

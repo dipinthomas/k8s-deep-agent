@@ -3,10 +3,11 @@
 # Bypasses Lambda/SNS — useful for testing without needing Lambda inside VPC.
 #
 # Usage:
-#   bash infra/trigger-agent-direct.sh           # trigger ALARM (disk pressure scenario)
-#   bash infra/trigger-agent-direct.sh cpu       # trigger ALARM (noisy-neighbor / CPU scenario)
-#   bash infra/trigger-agent-direct.sh ok        # trigger OK (resolved)
-#   bash infra/trigger-agent-direct.sh <url>     # override LB URL (still uses disk scenario)
+#   bash infra/trigger-agent-direct.sh                       # ALARM (disk pressure scenario)
+#   bash infra/trigger-agent-direct.sh cpu                   # ALARM (noisy-neighbor / CPU scenario)
+#   bash infra/trigger-agent-direct.sh ok                    # OK (resolved)
+#   bash infra/trigger-agent-direct.sh <url>                 # override LB URL (still uses disk scenario)
+#   bash infra/trigger-agent-direct.sh cpu --node i-abc123   # explicit node override
 
 set -euo pipefail
 
@@ -27,10 +28,44 @@ if [[ -z "$AGENT_URL" ]]; then
   exit 1
 fi
 
-# Auto-detect the checkout node for realistic alarm data
-CHECKOUT_NODE=$(kubectl get pod -n otel-demo \
-  -l app.kubernetes.io/component=checkout \
-  -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || echo "i-unknown")
+# Resolve the affected node dynamically. Try in order:
+#   1. --node <name> override (highest priority)
+#   2. otel-demo checkout pod's node (real demo deployment)
+#   3. node hosting the demo-stress fault-injection pod
+#   4. first Ready worker node in the cluster
+CHECKOUT_NODE=""
+
+# Allow --node <name> as the LAST argument
+for arg in "$@"; do
+  if [[ -n "${NEXT_IS_NODE:-}" ]]; then
+    CHECKOUT_NODE="$arg"
+    NEXT_IS_NODE=""
+  elif [[ "$arg" == "--node" ]]; then
+    NEXT_IS_NODE=1
+  fi
+done
+
+if [[ -z "$CHECKOUT_NODE" ]]; then
+  CHECKOUT_NODE=$(kubectl get pod -n otel-demo \
+    -l app.kubernetes.io/component=checkout \
+    -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null || true)
+fi
+
+if [[ -z "$CHECKOUT_NODE" ]]; then
+  CHECKOUT_NODE=$(kubectl get pod demo-stress -n default \
+    -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)
+fi
+
+if [[ -z "$CHECKOUT_NODE" ]]; then
+  CHECKOUT_NODE=$(kubectl get nodes \
+    -o jsonpath='{range .items[?(@.status.conditions[-1].type=="Ready")]}{.metadata.name}{"\n"}{end}' \
+    2>/dev/null | head -1)
+fi
+
+if [[ -z "$CHECKOUT_NODE" ]]; then
+  echo "Error: could not resolve a node. Pass --node <name> explicitly." >&2
+  exit 1
+fi
 
 if [[ "$SCENARIO" == "ok" || "$SCENARIO" == "OK" ]]; then
   PAYLOAD_STATE="OK"

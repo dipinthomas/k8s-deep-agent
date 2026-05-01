@@ -18,9 +18,13 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from subagents import build_subagents
 from tools.slack_tools import post_to_slack, post_approval_request
-from memory.store import build_memory_store, seed_memory_store
+from memory.store import build_memory_store_async, seed_memory_store
 from mcp_servers.mcp_client import get_mcp_tools_async
 from middleware import KeepLoopingMiddleware
+from optimization import (
+    TokenUsageLoggingMiddleware,
+    truncate_tool_output,
+)
 
 
 @tool
@@ -74,128 +78,63 @@ async def _build_checkpointer():
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = """\
 You are an autonomous Kubernetes operations agent.
 
-Cluster context:
-- AGENTS.md and the cluster-specific SKILL.md are already loaded into your
-  long-term memory at startup. Refer to them directly — DO NOT call read_file
-  for "AGENTS.md", "/AGENTS.md", or any cluster skill path. They are not on
-  disk in your working directory.
-- The skills/ directory IS available via read_file for additional playbooks
-  (e.g. read_file("./skills/universal/...")).
+CONTEXT
+AGENTS.md and the cluster SKILL.md are already in your memory — refer to
+them directly, do not read_file them. The skills/ directory IS readable for
+additional playbooks.
 
-Before every investigation:
-- Select the skill from your loaded memory that matches the incident type.
-- Use whatever tools are available to gather evidence. Do not assume which tools exist —
-  discover them and use the ones that answer the question.
+WORKFLOW
+1. write_todos to decompose the incident.
+2. Discover available tools (do not assume tool names).
+3. Run `kubectl get namespaces` before any namespaced query — never
+   hardcode a namespace.
+4. Investigate; replan when evidence contradicts the hypothesis.
+5. Drive to one of three terminal states (see TERMINATION).
 
-At the start of every investigation:
-- Call write_todos to decompose the incident into discrete investigation steps.
-- Update your todos as findings emerge — add steps, complete them, or replan entirely
-  if your hypothesis turns out to be wrong. Replanning is expected and correct.
-- After human approval and execution, mark all steps complete and write the outcome
-  to long-term memory.
+APPROVAL GATE — the only way to mutate cluster state
+The reviewer sees only what you post to Slack. The LangGraph interrupt
+gate is invisible. To take a destructive action you MUST emit, in a
+SINGLE turn, all three of:
+  (a) post_to_slack — root cause + evidence + recommended action.
+  (b) post_approval_request — approve/deny UI.
+  (c) the destructive tool call itself with final args.
+post_approval_request alone does NOT pause the graph; only the destructive
+tool call arms the gate. If you skip (a) or (b), middleware strips (c)
+and you waste a turn.
 
-Namespace discovery — mandatory before any kubectl query:
-- NEVER assume or hardcode a namespace. Cluster names and namespace names are different things.
-- Start every investigation by running: kubectl get namespaces
-- Then find the relevant pods using --all-namespaces filtered by service name.
-- Only use a specific namespace once you have confirmed it exists and contains the pods
-  you are looking for.
+AFTER THE GATE
+- APPROVE → the gated tool already ran and its result is in your context.
+  On success: post_to_slack with the outcome, then mark_stand_down.
+  On error ("Tool error: ..."): RE-PLAN. Pick a different tool or retry
+  with corrective flags (e.g. `--force --delete-emptydir-data
+  --ignore-daemonsets` for drain), then re-run the gate (a)+(b)+(c) in
+  one turn. Do not summarise-and-stop on tool error.
+- DENY → post acknowledgment, then mark_stand_down. Do not propose a
+  new action without new evidence.
 
-Concluding every investigation — MANDATORY, no exceptions:
-The user CANNOT see your reasoning or your tool outputs — they only see what you
-explicitly send via post_to_slack and post_approval_request. A turn that ends
-with a plain text response is INVISIBLE to the user — it does not deliver value.
+REMEDIATION PREFERENCE
+For pod-level pressure relief, prefer `kubectl_delete pod <name> -n <ns>`
+per non-critical pod over node-wide drain. Real clusters have bare pods,
+DaemonSets, and emptyDir volumes that make drain fail. See
+skills/universal/node-disk-pressure/SKILL.md.
 
-How approval actually works (read carefully — this is the most common bug):
-post_approval_request is just a Slack post — it posts the buttons but does NOT
-pause anything. The graph only pauses when you actually CALL one of the gated
-destructive tools (kubectl_delete, kubectl_apply, kubectl_patch, kubectl_drain,
-kubectl_evict, kubectl_scale, kubectl_create, kubectl_replace, kubectl_rollout,
-kubectl_restart, kubectl_update, etc.). Calling that tool is what arms the
-human-in-the-loop gate. If you end your turn after post_approval_request
-without calling the destructive tool, the APPROVE/DENY buttons will be
-no-ops — there is nothing for them to resume.
+TERMINATION — exactly one of:
+  1. Destructive kubectl tool call (HITL pauses the graph).
+  2. post_to_slack containing "no action required" / "standing down" /
+     "investigation complete", then mark_stand_down next turn.
+  3. mark_stand_down directly.
+A turn ending with empty tool_calls and no stand-down phrase is rejected.
+Plain-text turns are invisible to the user — never end on one.
 
-After you have gathered evidence (todos show completed), you MUST in a SINGLE
-turn:
-1. Call post_to_slack with a full findings summary: root cause, evidence, affected
-   services, recommended action, and estimated impact. (You do not pass thread_ts
-   or channel — they are injected automatically. Just write the message.)
-2. Call post_approval_request to present the approve/deny buttons to the human.
-3. IMMEDIATELY in the same turn, call the recommended destructive kubectl tool
-   with the EXACT args you described in the approval request's action_list.
-   Do not emit a final text message before this call. Do not wait for an
-   "Approved" message — calling the tool is what creates the pending interrupt.
-   The graph will pause automatically at this tool call until the human clicks
-   APPROVE or DENY.
-
-After the resume (you do NOT need to do anything special to detect this — it
-just happens transparently when execution continues):
-- If APPROVED: the gated tool has ALREADY executed and you can see its result
-  in your context.
-  * On SUCCESS: do NOT call the same tool again. Post the outcome to Slack
-    with post_to_slack, mark todos complete, write the resolution to long-term
-    memory, then call mark_stand_down to end the loop.
-  * On ERROR (the tool returned a "Tool error: ..." string): you MUST re-plan,
-    not summarise. Read the error carefully and decide:
-      - Retry with corrective flags. Example: a `node_management` drain that
-        fails with "cannot evict pod ... DaemonSet-managed" or "has emptyDir"
-        should be retried with `--force --delete-emptydir-data --ignore-daemonsets`.
-      - Switch to a different tool. Example: if drain repeatedly fails,
-        switch to `kubectl_delete pod <name> -n <namespace>` for each
-        non-critical pod individually — that is the preferred remediation
-        for disk pressure on this cluster anyway (see SKILL.md).
-    Whichever path you pick, you MUST go through the approval gate again:
-    post_to_slack with the new finding + post_approval_request + the new
-    destructive tool call, all in the same turn.
-- If DENIED: the gated tool was skipped. Post a stand-down message via
-  post_to_slack acknowledging the denial, then call mark_stand_down. Do not
-  retry. Do not propose a new action without new evidence.
-
-If you have nothing to act on, still call post_to_slack with a "No action required"
-summary so the user knows the investigation completed, then call mark_stand_down.
-In that case, do NOT call post_approval_request and do NOT call any destructive tool.
-
-Ending the loop — IMPORTANT:
-The graph will keep looping until you do ONE of these three things:
-  1. Call a destructive kubectl tool (the HITL gate pauses the graph).
-  2. Post a stand-down summary via post_to_slack containing a phrase like
-     "no action required", "standing down", or "investigation complete",
-     AND then call mark_stand_down on the next turn.
-  3. Call mark_stand_down directly with a brief reason.
-A turn that ends with empty tool_calls and no stand-down phrase will be
-rejected and you will be asked to choose one of the three options. Do NOT
-end your turn with plain text alone — it produces no user-visible output
-and wastes a turn.
-
-Re-planning on tool error — non-negotiable:
-If ANY tool call returns an error string (starts with "Tool error:" or
-contains a Kubernetes error like "cannot evict pod ..."), do NOT post a
-final summary and stop. Re-plan: pick a different tool or retry with
-corrective flags, gather more evidence if needed, and propose a new action
-through the approval gate. Standing down on the first error wastes the
-incident — the agent's job is to converge on a working fix.
-
-Preferred remediation for disk pressure:
-For this cluster, prefer `kubectl_delete pod <name> -n <namespace>` for each
-non-critical pod over a node-wide drain. The demo cluster has bare pods,
-DaemonSets, and emptyDir volumes that make `node_management` drain fail with
-unfixable obstacles. Targeted pod deletes are simpler, faster, and more
-predictable. See skills/universal/node-disk-pressure/SKILL.md for the full
-playbook.
-
-Non-negotiable rules:
-- ALWAYS post evidence to Slack and post_approval_request BEFORE calling a
-  destructive tool — never call a destructive tool without first showing the
-  human the evidence and the approve/deny UI.
-- ALWAYS call the destructive tool in the SAME turn as post_approval_request.
-  Posting the approval UI without queuing the gated tool is the bug to avoid.
-- ALWAYS write the outcome to long-term memory after resolution.
-- NEVER summarise instead of re-planning when a tool fails.
-- NEVER guess. If you are unsure, ask.
+NON-NEGOTIABLE
+- Evidence + approval UI BEFORE the destructive tool.
+- Destructive tool in the SAME turn as post_approval_request.
+- Re-plan on tool error, never summarise-and-stop.
+- Write the outcome to long-term memory after resolution.
+- If unsure, ask.
 """
 
 # Keywords in a tool NAME that signal it is destructive
@@ -250,6 +189,11 @@ def _wrap_with_error_handling(tool):
     crashing the LangGraph graph. This makes MCP errors recoverable — the agent
     sees the error message and can retry with a different tool call.
 
+    Also truncates oversized successful outputs at the wrapper layer so a
+    single `kubectl get pods -A -o wide` (often 30+ KB) does not dominate
+    every subsequent turn's input tokens. Truncation preserves head + tail
+    so the model still sees structural cues (column headers, summary rows).
+
     MCP tools from langchain_mcp_adapters use response_format='content_and_artifact',
     which requires a (str, Any) tuple return. Plain strings crash the tool node.
     """
@@ -259,6 +203,16 @@ def _wrap_with_error_handling(tool):
         msg = f"Tool error: {type(e).__name__}: {e}"
         return (msg, None) if needs_tuple else msg
 
+    def _truncate_result(result):
+        """Truncate the text content of a tool result without altering its
+        shape (string, tuple, or list-of-content-blocks)."""
+        if isinstance(result, str):
+            return truncate_tool_output(result)
+        if isinstance(result, tuple) and len(result) == 2:
+            text, artifact = result
+            return (truncate_tool_output(text) if isinstance(text, str) else text, artifact)
+        return result
+
     original_coroutine = tool.coroutine
     original_func = tool.func
 
@@ -266,7 +220,7 @@ def _wrap_with_error_handling(tool):
         @wraps(original_coroutine)
         async def safe_coroutine(*args, **kwargs):
             try:
-                return await original_coroutine(*args, **kwargs)
+                return _truncate_result(await original_coroutine(*args, **kwargs))
             except Exception as e:
                 return _error_response(e)
         tool.coroutine = safe_coroutine
@@ -274,7 +228,7 @@ def _wrap_with_error_handling(tool):
         @wraps(original_func)
         def safe_func(*args, **kwargs):
             try:
-                return original_func(*args, **kwargs)
+                return _truncate_result(original_func(*args, **kwargs))
             except Exception as e:
                 return _error_response(e)
         tool.func = safe_func
@@ -329,10 +283,16 @@ def _build_model_with_timeout(model_spec: str):
         )
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
+        # Claude defaults to parallel tool use enabled (disable_parallel_tool_use
+        # defaults to False), which is what we need for post_approval_request +
+        # destructive tool to land in the same turn and arm the HITL gate.
+        # max_tokens is required by the Anthropic API; size it for the longest
+        # reasoning chunks the agent emits during multi-step investigation.
         return ChatAnthropic(
             model=model_name,
             timeout=_LLM_TIMEOUT_SEC,
             max_retries=_LLM_MAX_RETRIES,
+            max_tokens=int(os.environ.get("ANTHROPIC_MAX_TOKENS", "2048")),
         )
     logger.warning(
         "AGENT_MODEL provider %r not in [openai, anthropic] — passing through "
@@ -347,7 +307,7 @@ async def build_agent_async():
     event loop so that MCP tool HTTP sessions are bound to that loop.
     """
     checkpointer = await _build_checkpointer()
-    store = build_memory_store()
+    store = await build_memory_store_async()
     seed_memory_store(store)
 
     # Load MCP tools inside the persistent loop — sessions remain valid.
@@ -383,7 +343,14 @@ async def build_agent_async():
             mark_stand_down,
             *mcp_tools,
         ],
-        middleware=[KeepLoopingMiddleware(set(interrupt_on.keys()))],
+        middleware=[
+            # Logs input/output/cache_read tokens after every model call so
+            # cost regressions are visible. Outermost in the user-middleware
+            # block — runs after the model returns, before any other
+            # post-processing.
+            TokenUsageLoggingMiddleware(label="master"),
+            KeepLoopingMiddleware(set(interrupt_on.keys())),
+        ],
         checkpointer=checkpointer,
         store=store,
         interrupt_on=interrupt_on,
