@@ -4,9 +4,11 @@ Token-cost optimization middleware and helpers.
 Three concerns live here, all aimed at cutting input-token spend without
 touching the agent graph, interrupt machinery, or KeepLoopingMiddleware:
 
-1. TokenUsageLoggingMiddleware — wraps every model call and logs Anthropic
-   usage_metadata (input / output / cache_read / cache_creation) so we can
-   see cache hit rates and verify other optimisations actually save tokens.
+1. TokenUsageLoggingMiddleware — wraps every model call and logs LangChain's
+   normalized usage_metadata (input / output / cache_read / cache_creation)
+   so we can see cache hit rates and verify other optimisations actually
+   save tokens. Works for any provider LangChain supports; cache_read is
+   only populated by providers with prefix caching.
 
 2. ToolOutputTruncator — truncates oversized MCP tool outputs at the wrapper
    layer. Raw kubectl output (`get pods -A -o wide`) and CloudWatch
@@ -44,16 +46,19 @@ class TokenUsageLoggingMiddleware(AgentMiddleware):
     """Log every model call's token usage at INFO so cache hit rate and
     per-turn input-token spend are visible.
 
-    Anthropic's usage_metadata exposes:
+    LangChain normalises usage_metadata across providers:
       - input_tokens         (excluding cached prefix reads)
       - output_tokens
       - input_token_details.cache_read       (read from the prefix cache)
       - input_token_details.cache_creation   (newly written to the cache)
 
-    A healthy steady-state investigation should show input_tokens shrink to
-    a small number while cache_read grows large. If cache_read stays at 0,
-    something invalidated the prefix between turns (often: the system
-    prompt or tools list changed shape).
+    Not every provider populates cache_read in usage_metadata — OpenAI
+    (we use /responses via use_responses_api=True) doesn't surface it,
+    so cache_read stays at 0 there and only input/output counts are
+    meaningful. Anthropic does populate it, in which case a healthy
+    steady-state investigation shows input_tokens shrink while
+    cache_read grows; cache_read=0 across turns means the prefix is
+    being invalidated (often: prompt or tools list changed shape).
     """
 
     name = "TokenUsageLoggingMiddleware"
