@@ -31,16 +31,19 @@ echo ""
 if [[ -n "${TARGET_NODE:-}" ]]; then
   echo "==> Using node from env: $TARGET_NODE"
 else
-  echo "==> Finding a Ready worker node..."
+  # polinux/stress-ng only publishes amd64 — picking an arm64 node (e.g. the
+  # EKS Auto `system` NodePool) makes the container exit with "exec format error".
+  echo "==> Finding a Ready amd64 worker node..."
   TARGET_NODE=$(kubectl get nodes \
+    -l kubernetes.io/arch=amd64 \
     --no-headers \
     -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[?(@.type=="Ready")].status' \
     | awk '$2=="True" {print $1; exit}')
 fi
 
 if [[ -z "$TARGET_NODE" ]]; then
-  echo "ERROR: Could not find a Ready node. Is the cluster running?"
-  echo "       Try: kubectl get nodes"
+  echo "ERROR: Could not find a Ready amd64 node. Is the cluster running?"
+  echo "       Try: kubectl get nodes -L kubernetes.io/arch"
   exit 1
 fi
 
@@ -68,6 +71,8 @@ metadata:
     app: demo-stress
     # Clearly non-critical — agent should identify and recommend eviction
     app.kubernetes.io/component: stress-test
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
 spec:
   nodeName: ${TARGET_NODE}
   restartPolicy: Never

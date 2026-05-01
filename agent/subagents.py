@@ -2,14 +2,19 @@
 Subagent definitions for parallel incident investigation.
 
 Each subagent owns a domain (CloudWatch metrics, K8s cluster state, OTel traces).
-Each subagent receives ONLY the MCP tool subset its role needs (filtered by
-optimization.filter_mcp_tools_for_subagent) — sending all ~50 MCP tool schemas
-to every subagent costs ~30k input tokens per subagent invocation that we
-don't need to spend.
 
-Each subagent is also capped by ModelCallLimitMiddleware so a tool-error loop
-inside a subagent can't burn unbounded tokens. The cap (default 6 model calls
-per run) is generous for normal investigation but breaks runaway loops.
+Tool list: each subagent receives the FULL MCP tool list (same as the master
+agent). An earlier optimisation filtered tools per role by keyword match,
+which saved ~30k schema tokens per subagent invocation but risked silently
+dropping tools (e.g. anything whose name didn't contain a hard-coded
+keyword). Reverted because the cost is paid back by Anthropic prompt caching
+once the prefix stabilises, and one less moving part makes behaviour easier
+to reason about.
+
+Each subagent is capped by ModelCallLimitMiddleware so a tool-error loop
+inside a subagent can't burn unbounded tokens. The cap (default 15 model
+calls per run, env: SUBAGENT_MODEL_CALL_LIMIT) is generous for normal
+investigation but breaks runaway loops.
 
 Scenario-specific playbooks live in skills/.
 """
@@ -19,15 +24,12 @@ from typing import Any
 
 from langchain.agents.middleware.model_call_limit import ModelCallLimitMiddleware
 
-from optimization import (
-    TokenUsageLoggingMiddleware,
-    filter_mcp_tools_for_subagent,
-)
+from optimization import TokenUsageLoggingMiddleware
 
 # Per-run model-call cap inside a subagent. Default is generous; lower it if
 # subagent runs are still spending too many tokens, raise it if legitimate
 # investigations are getting cut off.
-_SUBAGENT_RUN_LIMIT = int(os.environ.get("SUBAGENT_MODEL_CALL_LIMIT", "6"))
+_SUBAGENT_RUN_LIMIT = int(os.environ.get("SUBAGENT_MODEL_CALL_LIMIT", "15"))
 
 
 _RETURN_CONTRACT = (
@@ -90,7 +92,7 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "- Explicit call-out if any metric is within normal range (absence of evidence matters)\n\n"
             + _RETURN_CONTRACT
         ),
-        "tools": filter_mcp_tools_for_subagent(mcp_tools, "cloudwatch"),
+        "tools": mcp_tools,
         "middleware": _subagent_middleware("subagent.cloudwatch"),
         "skills": [],
     }
@@ -119,7 +121,7 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "- Any pods in non-Running phase (Pending, Evicted, OOMKilled, CrashLoopBackOff)\n\n"
             + _RETURN_CONTRACT
         ),
-        "tools": filter_mcp_tools_for_subagent(mcp_tools, "kubectl"),
+        "tools": mcp_tools,
         "middleware": _subagent_middleware("subagent.kubectl"),
         "skills": [
             "./skills/universal/node-disk-pressure/",
@@ -154,7 +156,7 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "- A one-line user impact summary the master agent can quote in Slack\n\n"
             + _RETURN_CONTRACT
         ),
-        "tools": filter_mcp_tools_for_subagent(mcp_tools, "otel"),
+        "tools": mcp_tools,
         "middleware": _subagent_middleware("subagent.otel"),
         "skills": [
             "./skills/universal/critical-service-protection/",

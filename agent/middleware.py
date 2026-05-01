@@ -11,11 +11,27 @@ a summary it considers "the answer". LangGraph then exits and the user is
 left with a half-finished investigation — exactly what Deep Agents'
 plan/act/observe loop is supposed to prevent.
 
-The middleware sits between deepagents' base stack and the tail stack
-(AnthropicPromptCachingMiddleware, MemoryMiddleware, HumanInTheLoopMiddleware,
-in that order). This means our after_model hook runs AFTER the model emits
-the response but BEFORE HITL inspects it for interrupts — so if the model
-correctly queued a destructive tool, HITL still gets to arm its gate.
+== Known limitation observed in v39 (2026-05-01) ==
+
+When the model queues a destructive tool in the SAME AIMessage as
+post_to_slack / post_approval_request siblings, langchain's
+HumanInTheLoopMiddleware fires its __interrupt__ BEFORE this middleware's
+after_model / aafter_model hook is invoked at all. The agent stream
+chunks go straight from {'model': ...} to {'__interrupt__': ...} with no
+{'KeepLoopingMiddleware.after_model': ...} chunk in between.
+
+That means in-band Slack-tool execution from inside this middleware
+cannot rescue the parallel Slack siblings on a destructive turn — the
+hook never runs. Confirmed empirically with claude-haiku-4-5 across
+runs 8/9/10 on 2026-05-01. v36/v38 attempted to recover from main.py
+_drive after the interrupt fires; that worked for posting Slack but
+broke the resume path because aupdate_state mid-stream re-evaluates the
+graph and produces stale interrupt metadata.
+
+The reliable fix lives at the tool boundary, not in middleware:
+post_approval_request itself can post a findings message when called
+without a prior post_to_slack on the thread. That keeps the human
+visibility guarantee without depending on middleware ordering.
 """
 
 from __future__ import annotations
@@ -80,19 +96,21 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
 
     state_schema = KeepLoopingState  # type: ignore[assignment]
 
+    _SLACK_TOOL_NAMES = frozenset({"post_to_slack", "post_approval_request"})
+
     def __init__(self, destructive_tool_names: set[str]) -> None:
         super().__init__()
         self.destructive_tool_names = set(destructive_tool_names)
 
     # ── Hook ────────────────────────────────────────────────────────────────
     def after_model(self, state, runtime: Runtime[Any]) -> dict[str, Any] | None:  # type: ignore[override]
-        return self._after_model_logic(state)
+        return self._after_model_logic(state, runtime)
 
     async def aafter_model(self, state, runtime: Runtime[Any]) -> dict[str, Any] | None:  # type: ignore[override]
-        return self._after_model_logic(state)
+        return self._after_model_logic(state, runtime)
 
     # ── Core logic ──────────────────────────────────────────────────────────
-    def _after_model_logic(self, state) -> dict[str, Any] | None:
+    def _after_model_logic(self, state, runtime: Runtime[Any]) -> dict[str, Any] | None:
         messages = state.get("messages") or []
         if not messages:
             return None
@@ -116,29 +134,67 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
             )
             return {"explicit_stand_down": True}
 
-        # Case 0 — destructive tool queued WITHOUT post_to_slack +
-        # post_approval_request having been called yet this run. The HITL
-        # gate would arm with no Slack visibility for the human reviewer,
-        # leaving them no buttons to click. Strip the destructive tool_calls
-        # from this AIMessage (replace-by-id) and inject a corrective
-        # HumanMessage demanding the model re-issue with Slack first.
+        # Case 0 — destructive tool queued in this AIMessage. Two sub-cases:
+        #
+        #   (a) Slack calls (post_to_slack / post_approval_request) are also
+        #       queued in the SAME AIMessage as parallel siblings. HITL's
+        #       interrupt fires before the siblings execute, so the human
+        #       sees no buttons and resume crashes with Anthropic 400
+        #       (orphan tool_use). Recover IN-BAND: execute the Slack tools
+        #       directly here and append synthetic ToolMessages so the
+        #       message history has matching tool_use/tool_result pairs.
+        #       The destructive tool stays queued — HITL still pauses on it.
+        #
+        #   (b) Slack calls are missing entirely (not queued AND never
+        #       successfully called earlier). The reviewer would have no
+        #       Slack visibility. Strip the destructive call and ask the
+        #       model to re-issue Slack-first. Same as v34 behaviour.
         queued_destructive = [n for n in tool_names if n in self.destructive_tool_names]
         if queued_destructive:
+            slack_in_turn = [tc for tc in tool_calls if self._tc_name(tc) in self._SLACK_TOOL_NAMES]
             findings_posted = self._tool_called_recently(messages, "post_to_slack")
             approval_posted = self._tool_called_recently(messages, "post_approval_request")
-            if not (findings_posted and approval_posted):
+            findings_in_turn = any(self._tc_name(tc) == "post_to_slack" for tc in slack_in_turn)
+            approval_in_turn = any(self._tc_name(tc) == "post_approval_request" for tc in slack_in_turn)
+
+            findings_covered = findings_posted or findings_in_turn
+            approval_covered = approval_posted or approval_in_turn
+
+            if findings_covered and approval_covered and slack_in_turn:
+                # Sub-case (a): the model did its job. Execute the parallel
+                # Slack siblings in-band now, before HITL strands them.
+                synthetic = self._execute_slack_tools_inline(slack_in_turn, runtime)
+                if synthetic:
+                    logger.warning(
+                        "KeepLooping: destructive tool(s) %s queued with "
+                        "parallel Slack tool(s) — executed Slack in-band and "
+                        "appended %d synthetic ToolMessage(s) so HITL can "
+                        "pause on the destructive call without stranding the "
+                        "Slack siblings",
+                        queued_destructive, len(synthetic),
+                    )
+                    return {"messages": synthetic}
+                # If execution returned nothing (slack tools all errored before
+                # we could record results), fall through to no-op — the gate
+                # will still arm, the human just won't see buttons.
+                return None
+
+            if not (findings_covered and approval_covered):
+                # Sub-case (b): bounce the model.
                 logger.warning(
-                    "KeepLooping: destructive tool(s) %s queued without prior "
-                    "post_to_slack (findings=%s) and post_approval_request "
-                    "(approval=%s) — stripping destructive call(s) and forcing "
-                    "Slack-first re-issue",
-                    queued_destructive, findings_posted, approval_posted,
+                    "KeepLooping: destructive tool(s) %s queued without "
+                    "post_to_slack (findings=%s, in_turn=%s) and "
+                    "post_approval_request (approval=%s, in_turn=%s) — "
+                    "stripping destructive call(s) and forcing Slack-first "
+                    "re-issue",
+                    queued_destructive, findings_posted, findings_in_turn,
+                    approval_posted, approval_in_turn,
                 )
                 stripped = self._aimessage_without_tools(last, queued_destructive)
                 missing = []
-                if not findings_posted:
+                if not findings_covered:
                     missing.append("post_to_slack (findings summary)")
-                if not approval_posted:
+                if not approval_covered:
                     missing.append("post_approval_request (approve/deny buttons)")
                 missing_str = " AND ".join(missing)
                 return {
@@ -354,6 +410,74 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
             additional_kwargs=getattr(msg, "additional_kwargs", {}) or {},
             response_metadata=getattr(msg, "response_metadata", {}) or {},
         )
+
+    def _execute_slack_tools_inline(
+        self, tool_calls, runtime: Runtime[Any]
+    ) -> list[ToolMessage]:
+        """Invoke post_to_slack / post_approval_request synchronously and
+        return synthetic ToolMessages keyed to the same tool_call_ids.
+
+        Called from Case 0 sub-case (a) when the model queued Slack tools
+        as parallel siblings of a destructive tool. HITL would otherwise
+        strand the Slack siblings; we execute them in-band so the human
+        sees Slack output AND the next model call sees matching
+        tool_use/tool_result pairs (avoiding Anthropic 400)."""
+        # Lazy-import: tools.slack_tools imports slack_sdk at module load,
+        # which we don't want to pay for if the middleware isn't used.
+        from tools.slack_tools import post_to_slack, post_approval_request
+        handlers = {
+            "post_to_slack": post_to_slack,
+            "post_approval_request": post_approval_request,
+        }
+
+        # Build the RunnableConfig the slack tools expect. The config is
+        # plumbed through Runtime.context (LangGraph) and contains
+        # {"configurable": {"thread_ts": ..., "channel_id": ...}}.
+        cfg = self._extract_runnable_config(runtime)
+
+        results: list[ToolMessage] = []
+        for tc in tool_calls:
+            name = self._tc_name(tc)
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            handler = handlers.get(name)
+            if handler is None or not tc_id:
+                continue
+            args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+            try:
+                # Use synchronous .invoke — slack_sdk WebClient is sync, and
+                # this hook runs from both sync and async middleware paths.
+                content = handler.invoke(dict(args or {}), cfg)
+            except Exception as exc:
+                logger.exception(
+                    "KeepLooping: in-band Slack execution failed for %s", name
+                )
+                content = f"Slack-tool inline-execution error: {exc!r}"
+            results.append(
+                ToolMessage(content=str(content), name=name, tool_call_id=tc_id)
+            )
+        return results
+
+    @staticmethod
+    def _extract_runnable_config(runtime: Runtime[Any]) -> dict | None:
+        """Return the active LangGraph RunnableConfig so slack_tools._route
+        can pull thread_ts / channel_id from configurable.
+
+        LangGraph stashes the config in a contextvar; get_config() returns
+        it inside any node/middleware. Newer Runtimes also expose 'config'
+        directly. We try both."""
+        for attr in ("config", "_config"):
+            cfg = getattr(runtime, attr, None)
+            if isinstance(cfg, dict):
+                return cfg
+        try:
+            from langgraph.config import get_config
+            cfg = get_config()
+            if isinstance(cfg, dict):
+                return cfg
+        except Exception:
+            logger.debug("KeepLooping: get_config() unavailable", exc_info=True)
+        # Fallback: slack_tools._route falls back to env vars (channel only).
+        return None
 
     def _destructive_just_executed(self, messages) -> bool:
         """Return True if the most recent ToolMessage in history was for a

@@ -120,6 +120,23 @@ spec:
         # Must point to a SKILL.md under skills/clusters/<name>/.
         - name: CLUSTER_SKILL_PATH
           value: "./skills/clusters/otel-demo-prod/SKILL.md"
+        # Cost / quality knobs (rollback of v35 over-aggressive defaults — Apr 2026):
+        #   TOOL_OUTPUT_CHAR_LIMIT was 8000 by default in optimization.py and
+        #   was truncating real kubectl output mid-list, hiding the pod the
+        #   agent needed and pushing it into a CloudWatch fixation loop.
+        #   Effectively disable truncation until we have a smarter strategy
+        #   (e.g. truncate only on history replay, not first-read).
+        - name: TOOL_OUTPUT_CHAR_LIMIT
+          value: "999999999"
+        #   Subagent run-cap was 6, which terminated subagents before they
+        #   could finish a real investigation. 15 gives headroom without
+        #   permitting unbounded loops.
+        - name: SUBAGENT_MODEL_CALL_LIMIT
+          value: "15"
+        #   Output token cap restored to the pre-v35 default. 2048 was
+        #   chopping legitimate enumerate-and-propose turns mid-tool-call.
+        - name: ANTHROPIC_MAX_TOKENS
+          value: "8192"
         # MCP sidecar URLs — sidecars run in the same pod so we use localhost.
         - name: KUBECTL_MCP_URL
           value: "http://localhost:3001/mcp"
