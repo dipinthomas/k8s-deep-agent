@@ -52,12 +52,13 @@ class TokenUsageLoggingMiddleware(AgentMiddleware):
       - input_token_details.cache_read       (read from the prefix cache)
       - input_token_details.cache_creation   (newly written to the cache)
 
-    For providers without prefix caching (e.g. OpenAI on /chat/completions),
-    cache_read stays at 0 — only the input/output counts are meaningful.
-    On providers with caching, a healthy steady-state investigation shows
-    input_tokens shrink while cache_read grows; cache_read=0 across turns
-    means the prefix is being invalidated (often: prompt or tools list
-    changed shape).
+    Not every provider populates cache_read in usage_metadata — OpenAI
+    (we use /responses via use_responses_api=True) doesn't surface it,
+    so cache_read stays at 0 there and only input/output counts are
+    meaningful. Anthropic does populate it, in which case a healthy
+    steady-state investigation shows input_tokens shrink while
+    cache_read grows; cache_read=0 across turns means the prefix is
+    being invalidated (often: prompt or tools list changed shape).
     """
 
     name = "TokenUsageLoggingMiddleware"
