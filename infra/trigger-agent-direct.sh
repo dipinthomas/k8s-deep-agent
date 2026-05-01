@@ -40,7 +40,7 @@ if [[ "$SCENARIO" == "ok" || "$SCENARIO" == "OK" ]]; then
 elif [[ "$SCENARIO" == "cpu" || "$SCENARIO" == "CPU" ]]; then
   PAYLOAD_STATE="ALARM"
   ALARM_NAME="EKS-NodeCPUHigh-otel-demo-prod"
-  REASON="Node CPU utilisation at 81% (threshold: 75%). Checkout service p99 latency rising: 145ms -> 620ms. Unidentified workload consuming ${NODE_CPU:-8} cores on node."
+  REASON="Node CPU utilisation at 81% (threshold: 75%). Application service p99 latency rising: 145ms -> 620ms. Unidentified workload consuming ${NODE_CPU:-8} cores on node."
 
 else
   # Default: disk pressure scenario
