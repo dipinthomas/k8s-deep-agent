@@ -323,6 +323,14 @@ Resources:
         - ServiceAccount: cloudwatch-agent
           RoleArn: !GetAtt CloudWatchAgentRole.Arn
 
+  MetricsServerAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: Cluster
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: metrics-server
+      ResolveConflicts: OVERWRITE
+
 Outputs:
   ClusterName:
     Value: !Ref Cluster
