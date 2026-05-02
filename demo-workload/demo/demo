@@ -15,6 +15,14 @@
 set -euo pipefail
 NS=shop-prod
 
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$HERE/.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$HERE/.env"
+fi
+export AWS_PROFILE="${AWS_PROFILE:-fernhub}"
+export AWS_REGION="${AWS_REGION:-us-east-1}"
+
 case "${1:-}" in
   healthy)
     kubectl -n "$NS" set env deploy/latency-synthesizer SCENARIO=healthy
@@ -42,6 +50,7 @@ case "${1:-}" in
       echo -n "Alarm state: "
       aws cloudwatch describe-alarms \
         --alarm-names checkoutservice-p99-latency-high \
+        --region "$AWS_REGION" \
         --query 'MetricAlarms[0].StateValue' --output text 2>/dev/null \
         || echo "(alarm not yet created)"
     fi
@@ -50,13 +59,15 @@ case "${1:-}" in
     kubectl -n "$NS" logs -l app=latency-synthesizer -c synth -f
     ;;
   lambda-logs)
-    aws logs tail /aws/lambda/retail-prod-alarm-to-agent --follow --format short
+    aws logs tail /aws/lambda/retail-prod-alarm-to-agent --follow --format short \
+      --region "$AWS_REGION"
     ;;
   dlq)
     aws sqs get-queue-attributes \
       --queue-url "$(aws sqs get-queue-url --queue-name retail-prod-alarm-to-agent-dlq \
-                       --query QueueUrl --output text)" \
+                       --region "$AWS_REGION" --query QueueUrl --output text)" \
       --attribute-names ApproximateNumberOfMessages \
+      --region "$AWS_REGION" \
       --query 'Attributes.ApproximateNumberOfMessages' --output text
     ;;
   test-alarm)
@@ -65,7 +76,8 @@ case "${1:-}" in
     aws cloudwatch set-alarm-state \
       --alarm-name checkoutservice-p99-latency-high \
       --state-value ALARM \
-      --state-reason "manual smoke test from ./demo test-alarm at $(date -u +%FT%TZ)"
+      --state-reason "manual smoke test from ./demo test-alarm at $(date -u +%FT%TZ)" \
+      --region "$AWS_REGION"
     echo "→ Alarm forced to ALARM. Watch:"
     echo "    ./demo lambda-logs       # for the Lambda invocation"
     echo "    Slack #retail-prod-incidents for Chatbot card + agent ack"

@@ -20,8 +20,8 @@ data:
       awsxray:
         region: us-east-1
         indexed_attributes: [service.name, http.status_code]
-      logging:
-        loglevel: info
+      debug:
+        verbosity: normal
 
     service:
       telemetry:
@@ -31,4 +31,4 @@ data:
         traces:
           receivers: [otlp]
           processors: [batch]
-          exporters: [awsxray, logging]
+          exporters: [awsxray, debug]

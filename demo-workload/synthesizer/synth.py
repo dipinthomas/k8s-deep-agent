@@ -33,6 +33,9 @@ from opentelemetry.sdk.trace.export import (
     ConsoleSpanExporter,
 )
 from opentelemetry.trace import SpanKind, Status, StatusCode
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+_propagator = TraceContextTextMapPropagator()
 
 import distributions
 import topology
@@ -194,15 +197,17 @@ def execute_call(
     parent_ctx,
     dists: dict,
 ) -> tuple[float, bool]:
-    """Execute one call in the topology recursively. Returns (own latency, errored)."""
+    """Execute one call in the topology recursively. Returns (total latency, errored)."""
     tracer = providers[call.service].get_tracer("synth")
     own_params = dists[call.service]
     own_latency_ms = max(1.0, distributions.sample_ms(own_params))
 
+    start_wall = time.monotonic()
+
     with tracer.start_as_current_span(
         call.operation,
         context=parent_ctx,
-        kind=SpanKind.SERVER if parent_ctx is None else SpanKind.INTERNAL,
+        kind=SpanKind.SERVER,
         attributes={
             "http.method": call.operation.split(" ")[0],
             "http.route": call.operation.split(" ")[1] if " " in call.operation else call.operation,
@@ -217,17 +222,28 @@ def execute_call(
         ):
             _burn_cpu_ms(min(own_latency_ms * 0.1, 80.0))
 
-        # Recurse into children, executing them sequentially under our span.
+        # Recurse into children. Simulate HTTP header propagation so ADOT
+        # treats each downstream service span as a remote-parent segment
+        # (rather than a local subsegment), making all 5 services visible
+        # in the X-Ray service map.
         from opentelemetry import context as ot_context
-        new_ctx = ot_context.get_current()
+        carrier: dict = {}
+        _propagator.inject(carrier, context=ot_context.get_current())
+        remote_ctx = _propagator.extract(carrier)
 
         child_errored = False
         for child in call.children:
-            _, c_err = execute_call(child, providers, new_ctx, dists)
+            _, c_err = execute_call(child, providers, remote_ctx, dists)
             child_errored = child_errored or c_err
 
         # Sleep for our own work portion of the latency.
         time.sleep(own_latency_ms / 1000.0)
+
+        # Total latency = wall time (includes children + own sleep). This is
+        # what a real service would report: the full time to serve the request
+        # including downstream calls. Ensures that when paymentservice is slow
+        # the checkoutservice CW metric shows elevated latency too.
+        total_latency_ms = (time.monotonic() - start_wall) * 1000.0
 
         errored = False
         # Spike-mode error injection: 3% of checkoutservice calls fail
@@ -240,12 +256,12 @@ def execute_call(
                 span.set_attribute("http.status_code", 504)
 
         if errored or child_errored:
-            METRICS.record(call.service, own_latency_ms, errored=True)
+            METRICS.record(call.service, total_latency_ms, errored=True)
         else:
             span.set_attribute("http.status_code", 200)
-            METRICS.record(call.service, own_latency_ms, errored=False)
+            METRICS.record(call.service, total_latency_ms, errored=False)
 
-        return own_latency_ms, (errored or child_errored)
+        return total_latency_ms, (errored or child_errored)
 
 
 def run_one_request(providers: dict) -> None:
