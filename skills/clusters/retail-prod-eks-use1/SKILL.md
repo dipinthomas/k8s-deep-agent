@@ -3,8 +3,7 @@ name: retail-prod-eks-use1
 description: Load this skill when operating against the retail-prod-eks-use1
              cluster. Defines the synthetic e-commerce checkout workload's
              services, tiers, priority classes, and known incident patterns.
-             The workload itself is built and deployed from the sibling
-             k8s-agent-demo-workload repo.
+             The workload itself lives in this repo under demo-workload/.
 ---
 
 # Cluster Context: retail-prod-eks-use1 (EKS us-east-1)

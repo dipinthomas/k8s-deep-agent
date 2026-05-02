@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Demo control entrypoint.
+#
+# Usage:
+#   ./demo healthy        switch to healthy scenario, scale noisy pod to 0
+#   ./demo spike          switch to spike scenario, scale noisy pod to 1
+#   ./demo reset          alias for healthy
+#   ./demo status         show synthesizer + (later) alarm state
+#   ./demo logs           tail synth container logs
+#
+# Note: scenarios `spike` requires noisy-neighbor Deployment to exist
+# (added in step 9 of the build plan). For steps 1-3 only `healthy` and
+# `logs` / `status` are useful.
+
+set -euo pipefail
+NS=shop-prod
+
+case "${1:-}" in
+  healthy)
+    kubectl -n "$NS" set env deploy/latency-synthesizer SCENARIO=healthy
+    if kubectl -n "$NS" get deploy/inventory-sync-job >/dev/null 2>&1; then
+      kubectl -n "$NS" scale deploy/inventory-sync-job --replicas=0
+    fi
+    echo "→ healthy. Allow ~60s for any active alarm to clear."
+    ;;
+  spike)
+    if kubectl -n "$NS" get deploy/inventory-sync-job >/dev/null 2>&1; then
+      kubectl -n "$NS" scale deploy/inventory-sync-job --replicas=1
+    else
+      echo "(noisy-neighbor deploy not present — only synthesizer scenario will change)"
+    fi
+    kubectl -n "$NS" set env deploy/latency-synthesizer SCENARIO=spike
+    echo "→ spike. Alarm should fire in ~60s once that step is wired up."
+    ;;
+  reset)
+    "$0" healthy
+    ;;
+  status)
+    kubectl -n "$NS" get deploy
+    echo
+    if command -v aws >/dev/null 2>&1; then
+      echo -n "Alarm state: "
+      aws cloudwatch describe-alarms \
+        --alarm-names checkoutservice-p99-latency-high \
+        --query 'MetricAlarms[0].StateValue' --output text 2>/dev/null \
+        || echo "(alarm not yet created)"
+    fi
+    ;;
+  logs)
+    kubectl -n "$NS" logs -l app=latency-synthesizer -c synth -f
+    ;;
+  lambda-logs)
+    aws logs tail /aws/lambda/retail-prod-alarm-to-agent --follow --format short
+    ;;
+  dlq)
+    aws sqs get-queue-attributes \
+      --queue-url "$(aws sqs get-queue-url --queue-name retail-prod-alarm-to-agent-dlq \
+                       --query QueueUrl --output text)" \
+      --attribute-names ApproximateNumberOfMessages \
+      --query 'Attributes.ApproximateNumberOfMessages' --output text
+    ;;
+  test-alarm)
+    # Force the alarm into ALARM state once, to smoke-test the SNS->Lambda->agent path
+    # without waiting for a real spike.
+    aws cloudwatch set-alarm-state \
+      --alarm-name checkoutservice-p99-latency-high \
+      --state-value ALARM \
+      --state-reason "manual smoke test from ./demo test-alarm at $(date -u +%FT%TZ)"
+    echo "→ Alarm forced to ALARM. Watch:"
+    echo "    ./demo lambda-logs       # for the Lambda invocation"
+    echo "    Slack #retail-prod-incidents for Chatbot card + agent ack"
+    ;;
+  *)
+    echo "Usage: $0 {healthy|spike|reset|status|logs|lambda-logs|dlq|test-alarm}"
+    exit 1
+    ;;
+esac
