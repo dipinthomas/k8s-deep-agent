@@ -76,13 +76,22 @@ A typical incident lifecycle:
 │       └── <cluster-name>/SKILL.md    ← Per-deployment cluster skill (workloads, tiers)
 │
 ├── infra/                             ← Cluster + agent deployment manifests
-└── slack/                             ← Slack bot setup + message templates
+├── slack/                             ← Slack bot setup + message templates
+│
+└── demo-workload/                     ← Synthetic checkout workload for the
+                                         retail-prod-eks-use1 cluster skill.
+                                         NOT imported by the agent. See
+                                         demo-workload/README.md.
 ```
 
-Application-specific deployment artefacts (sample workloads, fault-injection
-scripts, the conference demo) live alongside this repo but are not part of
-the agent itself. The agent operates on whatever cluster the cluster skill
-describes.
+The agent itself is application-agnostic. The `demo-workload/` directory
+contains a synthetic e-commerce workload (synthesizer, k8s manifests,
+CloudFormation, Lambda, control scripts) that drives a CloudWatch alarm
+to exercise the agent end-to-end. It is colocated for operational
+convenience — one repo, one branch, one PR — but no agent code references
+it. The cluster skill at `skills/clusters/retail-prod-eks-use1/SKILL.md`
+describes the cluster the workload populates; the workload itself is
+purely deployment artefacts.
 
 ---
 
