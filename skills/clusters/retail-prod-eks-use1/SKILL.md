@@ -80,7 +80,10 @@ or disrupt without explicit human approval.**
 | paymentservice        | <80ms  | <300ms | <0.1% |
 
 The active alarm is **`checkoutservice-p99-latency-high`** (threshold 300ms,
-period 30s, evaluation_periods 2). It will be added in step 5 of the build.
+period 30s, evaluation_periods 2). It fans out via SNS topic
+`retail-prod-incidents` to:
+- AWS Chatbot → Slack `#retail-prod-incidents` (alarm card)
+- Lambda `retail-prod-alarm-to-agent` → POST `/trigger` on the agent
 
 ## Known Patterns
 
