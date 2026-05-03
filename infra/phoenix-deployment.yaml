@@ -88,7 +88,11 @@ kind: Service
 metadata:
   name: phoenix
   namespace: k8s-agent
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
 spec:
+  type: LoadBalancer
   selector:
     app: phoenix
   ports:
