@@ -106,7 +106,9 @@ elevated P99 IS the incident — it is the root cause, not a symptom.
 - Do NOT conclude "expected load-test behavior" when `inventory-sync-job` is Running.
 - Do NOT stand down without posting an approval request.
 - The correct action is: post findings + `post_approval_request` + queue
-  `kubectl_delete pod <inventory-sync-job-pod> -n shop-prod` in the same turn.
+  `kubectl_scale deployment/inventory-sync-job -n shop-prod --replicas=0` in the same turn.
+  **Do NOT delete the individual pod** — `inventory-sync-job` is a Deployment and will
+  immediately restart if you delete the pod. Scale the Deployment to 0 replicas instead.
 
 **P99 > 1000ms with SCENARIO=spike** means the stress pod is amplifying the
 software-defined latency (expected ceiling ~500-600ms) by throttling the
@@ -157,11 +159,14 @@ Expected: `low-priority` — confirms it is safe to evict.
 
 ### Step 5 — Approval request + remediation
 Post findings to Slack, then issue `post_approval_request` AND the
-delete call in the same turn:
+scale call in the same turn:
 ```
-kubectl_delete pod <inventory-sync-job-pod-name> -n shop-prod
+kubectl_scale deployment/inventory-sync-job -n shop-prod --replicas=0
 ```
-After deletion, verify: `kubectl top pods -n shop-prod` should show CPU
+**Do NOT delete the individual pod** — deleting a Deployment's pod just restarts it.
+Scale the Deployment to 0 so the stress workload stops entirely.
+
+After scaling, verify: `kubectl top pods -n shop-prod` should show CPU
 returning to baseline within 30s. Check CloudWatch P99 returning below
 100ms for checkoutservice within 2 metric periods (~60s).
 
@@ -169,8 +174,8 @@ returning to baseline within 30s. Check CloudWatch P99 returning below
 
 | Symptom | Root Cause | Action |
 |---|---|---|
-| checkoutservice P99 high, paymentservice P99 high, no errors | CPU throttle from noisy neighbor | Delete `inventory-sync-job` pod |
-| checkoutservice 504s, paymentservice slow | Same — checkout times out waiting for payment | Delete `inventory-sync-job` pod |
+| checkoutservice P99 high, paymentservice P99 high, no errors | CPU throttle from noisy neighbor | Scale `inventory-sync-job` deployment to 0 |
+| checkoutservice 504s, paymentservice slow | Same — checkout times out waiting for payment | Scale `inventory-sync-job` deployment to 0 |
 
 ## Eviction Order
 
@@ -178,7 +183,8 @@ returning to baseline within 30s. Check CloudWatch P99 returning below
 2. Other low-priority workloads in `shop-prod`
 3. **STOP.** Anything user-facing or critical requires explicit human approval.
 
-Prefer `kubectl_delete pod <name> -n shop-prod` over node drain.
+Prefer `kubectl_scale deployment/<name> -n shop-prod --replicas=0` over pod delete or node drain.
+Pod delete alone does not stop a Deployment — it restarts immediately.
 
 ## Slack and Approval
 
