@@ -109,14 +109,21 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "agent a precise picture of what the cluster looks like right now.\n\n"
             "How to work:\n"
             "- Start by listing available tools. Do not assume tool names — discover them.\n"
+            "- ALWAYS run 'kubectl top pods --all-namespaces --sort-by=cpu' as one of your "
+            "  FIRST calls. Kubernetes has no CPUPressure node condition — CPU saturation "
+            "  is invisible unless you explicitly check it. A node can be fully CPU-saturated "
+            "  while all node conditions show Ready=True.\n"
             "- Start at the node level (conditions, resource pressure, taints), then move to "
             "  pod level (status, phase, restarts, resource usage, placement).\n"
             "- Always check recent events — they often explain what kubectl describe does not.\n"
             "- If a tool returns an error, note it and try an equivalent tool or narrower query.\n\n"
             "Output contract — always return:\n"
+            "- Top CPU-consuming pods across all namespaces (kubectl top pods --all-namespaces "
+            "  --sort-by=cpu) — REQUIRED even when all nodes look healthy. Include pod name, "
+            "  namespace, CPU (millicores), and whether the pod has a CPU limit set.\n"
             "- Node conditions (DiskPressure, MemoryPressure, PIDPressure, Ready) for all nodes\n"
-            "- For any node with a pressure condition: list of pods on that node with their "
-            "  priority class and resource usage\n"
+            "- For any node with a pressure condition OR any pod consuming >200m CPU: list all "
+            "  pods on that node with their priority class and resource usage\n"
             "- Recent warning events (last 15 minutes) across the namespace\n"
             "- Any pods in non-Running phase (Pending, Evicted, OOMKilled, CrashLoopBackOff)\n\n"
             + _RETURN_CONTRACT
@@ -125,6 +132,7 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
         "middleware": _subagent_middleware("subagent.kubectl"),
         "skills": [
             "./skills/universal/node-disk-pressure/",
+            "./skills/universal/noisy-neighbor/",
             "./skills/universal/pod-priority-eviction/",
         ],
     }

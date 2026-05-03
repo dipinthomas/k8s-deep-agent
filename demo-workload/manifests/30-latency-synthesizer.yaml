@@ -23,8 +23,17 @@ spec:
         app: latency-synthesizer
     spec:
       serviceAccountName: latency-synthesizer
-      # nodeSelector pinning is added in step 9 (noisy neighbor). For now
-      # the pod can land anywhere.
+      # Prefer a node that doesn't host the k8s-agent pod so that the
+      # stress pod (which co-locates with the synthesizer) cannot starve the
+      # agent's MCP sidecars during a demo investigation.
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: k8s-agent
+            topologyKey: kubernetes.io/hostname
+            namespaces: ["k8s-agent"]
       containers:
         - name: synth
           image: ${SYNTHESIZER_IMAGE}
@@ -44,6 +53,8 @@ spec:
               value: us-east-1
             - name: CW_NAMESPACE
               value: RetailProd/Services
+            - name: ENABLE_CPU_BURN
+              value: "true"   # burns real CPU on paymentservice during spike so stress-ng throttling is observable
           resources:
             requests:
               cpu: 100m

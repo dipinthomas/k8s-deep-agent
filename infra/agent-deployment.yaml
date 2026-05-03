@@ -102,7 +102,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v41
+        image: dipinthomas2003/k8s-deep-agent:v45
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -119,7 +119,7 @@ spec:
         # Cluster-specific skill injected at deploy time — change this to switch clusters.
         # Must point to a SKILL.md under skills/clusters/<name>/.
         - name: CLUSTER_SKILL_PATH
-          value: "./skills/clusters/otel-demo-prod/SKILL.md"
+          value: "./skills/clusters/retail-prod-eks-use1/SKILL.md"
         # Cost / quality knobs (rollback of v35 over-aggressive defaults — Apr 2026):
         #   TOOL_OUTPUT_CHAR_LIMIT was 8000 by default in optimization.py and
         #   was truncating real kubectl output mid-list, hiding the pod the

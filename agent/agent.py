@@ -111,10 +111,20 @@ or any "let me first verify access" call. The describe + top + per-node
 pod list together give you everything needed to identify the noisy
 neighbour or pressured workload in one round-trip.
 
+FIRST ACTION ON A SERVICE-LEVEL ALARM (node = "(service-level alarm)")
+Dispatch ALL THREE subagents in PARALLEL in the same turn as write_todos:
+  - kubectl-investigator   → cluster state, CPU usage, pod placement
+  - cloudwatch-investigator → LatencyP99 + ErrorRate for all services
+  - otel-investigator       → application-layer health
+Do NOT call kubectl_get / kubectl_describe / get_metric_data directly for
+the initial investigation — subagents handle all read-only work. The
+master agent's direct tool calls are reserved for the remediation step
+(kubectl_delete etc.) after subagent findings are in hand.
+
 NAMESPACE DISCOVERY — for non-node-scoped queries
 - NEVER hardcode a namespace. Cluster names ≠ namespace names.
-- If you need to find a service by name and don't know the namespace,
-  use --all-namespaces filtered by service / label selector.
+- The cluster SKILL.md specifies the workload namespace — read it first
+  if unsure. Pass namespace hints to subagents in the query.
 - Only use a specific namespace once you have CONFIRMED it exists and
   contains the workloads you're after (via kubectl_get on that namespace).
 

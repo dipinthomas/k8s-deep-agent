@@ -54,8 +54,14 @@ kubectl apply -f "$ROOT/manifests/20-collector-sidecar-config.yaml"
 echo "→ Applying synthesizer Deployment"
 envsubst < "$ROOT/manifests/30-latency-synthesizer.yaml" | kubectl apply -f -
 
+echo "→ Applying low-priority PriorityClass"
+kubectl apply -f "$ROOT/manifests/35-priority-class.yaml"
+
+echo "→ Applying inventory-sync-job (noisy-neighbor, starts at 0 replicas)"
+kubectl apply -f "$ROOT/manifests/40-inventory-sync-job.yaml"
+
 echo "→ Waiting for synthesizer pod to become Ready"
 kubectl -n shop-prod rollout status deploy/latency-synthesizer --timeout=120s
 echo "✓ Synthesizer running. Tail logs with:"
 echo "    kubectl -n shop-prod logs -l app=latency-synthesizer -c synth -f"
-echo "  Then check the X-Ray service map within 60s for the five services."
+echo "  Run './demo spike' to scale the noisy-neighbor pod and trigger the alarm."

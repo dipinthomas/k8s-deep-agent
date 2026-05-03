@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-sync-job
+  namespace: shop-prod
+  labels:
+    app: inventory-sync-job
+    app.kubernetes.io/part-of: retail-prod-demo-workload
+    app.kubernetes.io/component: noisy-neighbor
+spec:
+  replicas: 0      # ./demo healthy keeps this at 0; ./demo spike scales to 1
+  selector:
+    matchLabels:
+      app: inventory-sync-job
+  template:
+    metadata:
+      labels:
+        app: inventory-sync-job
+        app.kubernetes.io/component: noisy-neighbor
+      annotations:
+        # Prevent Karpenter from consolidating the node while the stress pod is
+        # running — consolidation would reschedule it elsewhere, breaking co-location.
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      priorityClassName: low-priority
+      # Force this pod onto the same node as the synthesizer so the CPU
+      # saturation affects paymentservice's CPU-burn loops.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchLabels:
+                app: latency-synthesizer
+            topologyKey: kubernetes.io/hostname
+      terminationGracePeriodSeconds: 5
+      containers:
+      - name: stress
+        image: ghcr.io/colinianking/stress-ng:latest
+        # --cpu 0 → use all available CPUs; --cpu-load 80 → target 80% per CPU.
+        # No CPU limit so CFS doesn't cap it — we want real node saturation,
+        # which is what throttles the synthesizer's paymentservice burn loops.
+        args: ["--cpu", "0", "--cpu-load", "50", "--timeout", "0", "--metrics-brief"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "64Mi"
+          # no cpu limit — intentional, to allow real node CPU saturation
