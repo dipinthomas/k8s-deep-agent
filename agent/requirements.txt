@@ -1,4 +1,7 @@
 deepagents>=0.1.0
+# Observability — Arize Phoenix (optional, enable via PHOENIX_ENABLED=true)
+arize-phoenix-otel>=0.6.0
+openinference-instrumentation-langchain>=0.1.0
 langchain-anthropic>=0.3.0
 langchain-openai>=0.3.0
 langchain-mcp-adapters>=0.1.0

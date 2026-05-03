@@ -36,6 +36,11 @@ import redis as redis_lib
 
 load_dotenv()
 
+# Phoenix tracing — must run before any LangChain/LangGraph execution.
+# Enabled by PHOENIX_ENABLED=true; no-op when the env var is absent.
+from observability import setup_phoenix
+setup_phoenix()
+
 # Structured DEBUG logging: each line is prefixed with a monotonic sequence number
 # so log lines can be sorted/grepped by order even when timestamps collide.
 # Use LOG_LEVEL=INFO to suppress debug output in production.
@@ -671,6 +676,7 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
         f"Channel: {channel}\n"
     )
 
+    investigation_failed = False
     try:
         stream_agent(
             [{"role": "user", "content": initial_message}],
@@ -681,6 +687,17 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
         # stream_agent already posted the failure to the thread.
         logger.exception("Investigation failed for thread_ts=%s", thread_ts)
         _investigations_delete(thread_ts)
+        investigation_failed = True
+
+    # Run evals after the investigation completes (pass or fail).
+    # Rule-based evals are synchronous and fast; LLM judges are scheduled async.
+    # Failures here are non-fatal — evals must never affect the investigation path.
+    if not investigation_failed:
+        try:
+            from evals.runner import run_post_investigation_evals
+            run_post_investigation_evals(thread_ts, channel, alarm, agent, run_async)
+        except Exception:
+            logger.exception("Post-investigation evals failed for thread_ts=%s — ignoring", thread_ts)
 
 
 @http_app.route("/trigger", methods=["POST"])
