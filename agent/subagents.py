@@ -64,8 +64,9 @@ def _subagent_middleware(label: str) -> list[Any]:
 def build_subagents(mcp_tools: list[Any]) -> list[dict]:
     """
     Build the three subagent definitions, injecting the MCP tools loaded
-    at startup. Each subagent receives a filtered tool subset matching its
-    role. Called once from agent.py during agent construction.
+    at startup. Each subagent receives the full MCP tool list — see module
+    docstring for why per-role filtering was reverted. Called once from
+    agent.py during agent construction.
     """
 
     cloudwatch_subagent = {

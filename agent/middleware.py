@@ -66,20 +66,9 @@ class KeepLoopingState(TypedDict):
 
     explicit_stand_down: set when the agent has declared the investigation
         is over (mark_stand_down called or stand-down phrase posted).
-    unarmed_gate_retry_count: number of consecutive turns where
-        post_approval_request was called without queuing a destructive tool.
-        Used to escalate the corrective message after repeated failures so
-        the agent does not spam Slack indefinitely.
     """
 
     explicit_stand_down: NotRequired[bool]
-    unarmed_gate_retry_count: NotRequired[int]
-
-
-# After this many consecutive turns of "post_approval_request without a
-# destructive tool", we escalate to demanding mark_stand_down so the loop
-# terminates rather than spinning forever.
-_MAX_UNARMED_GATE_RETRIES = 2
 
 
 class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
@@ -298,7 +287,7 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
                 # destructive tool via interrupt resume — i.e. an APPROVED
                 # action just ran and the agent is in post-remediation state.
                 if self._destructive_just_executed(messages):
-                    return {"unarmed_gate_retry_count": 0}
+                    return None
 
                 logger.info(
                     "KeepLooping: post_approval_request called without destructive "
@@ -306,7 +295,6 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
                     "the destructive tool alone in the next turn"
                 )
                 return {
-                    "unarmed_gate_retry_count": 0,
                     "messages": [
                         HumanMessage(
                             content=(
@@ -324,11 +312,6 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
                     ],
                 }
 
-        # Reset the retry counter once we see any other state — the model
-        # has either queued a destructive tool, called mark_stand_down, or
-        # is doing genuine investigation work.
-        if state.get("unarmed_gate_retry_count"):
-            return {"unarmed_gate_retry_count": 0}
         return None
 
     # ── Helpers ─────────────────────────────────────────────────────────────

@@ -18,18 +18,6 @@ NS_NODES = ("nodes",)             # Node-specific notes
 REDIS_URL = os.environ.get("REDIS_URL", "")
 
 
-def build_memory_store():
-    """
-    Build the in-memory store synchronously. Used as a fallback when REDIS_URL
-    is unset or the async Redis store cannot be initialised.
-
-    For Redis-backed persistence prefer build_memory_store_async() — that
-    function returns a store whose data survives pod restarts so cross-
-    incident learnings accumulate.
-    """
-    logger.info("Using InMemoryStore (no REDIS_URL set, or async builder not used)")
-    return InMemoryStore()
-
 
 async def build_memory_store_async():
     """

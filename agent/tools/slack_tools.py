@@ -30,6 +30,11 @@ _client = None
 # investigations are scoped to that process.
 _LAST_APPROVAL_FINGERPRINT: dict[str, str] = {}
 
+# Per-thread flag: True once post_to_slack has successfully posted findings
+# to that thread. Used by post_approval_request to auto-post a summary when
+# the model skips post_to_slack and jumps straight to the approval card.
+_THREAD_HAS_FINDINGS: dict[str, bool] = {}
+
 
 def _slack():
     global _client
@@ -77,6 +82,9 @@ def post_to_slack(message: str, config: RunnableConfig) -> str:
     """
     channel, thread_ts = _route(config)
     ts, err = _post("post_to_slack", channel, thread_ts, text=message, mrkdwn=True)
+    if not err:
+        thread_key = f"{channel}:{thread_ts}"
+        _THREAD_HAS_FINDINGS[thread_key] = True
     return f"Slack error: {err}" if err else f"Posted to Slack thread (ts={ts})"
 
 
@@ -120,6 +128,24 @@ def post_approval_request(
         impact:      One line: expected outcome + recovery time (e.g. "Stops stress workload · P99 back below 100ms within 60s")
     """
     channel, thread_ts = _route(config)
+    thread_key = f"{channel}:{thread_ts}"
+
+    # Auto-post findings if the model skipped post_to_slack and jumped
+    # straight to the approval card. The human must see evidence before
+    # the APPROVE/DENY buttons appear.
+    if not _THREAD_HAS_FINDINGS.get(thread_key):
+        findings_text = f"*Investigation findings*\n{summary}\n\n*Evidence:* {evidence}"
+        _, findings_err = _post(
+            "post_approval_request[auto-findings]", channel, thread_ts,
+            text=findings_text, mrkdwn=True,
+        )
+        if not findings_err:
+            _THREAD_HAS_FINDINGS[thread_key] = True
+            logger.info(
+                "post_approval_request: auto-posted findings to thread %s "
+                "(post_to_slack was not called before the approval card)",
+                thread_key,
+            )
 
     # Dedup guard: if we already posted an identical approval card to this
     # thread, refuse to post again. This prevents the "model loops on
@@ -128,7 +154,6 @@ def post_approval_request(
     fingerprint = hashlib.sha256(
         "|".join([summary, evidence, action_list, impact]).encode("utf-8")
     ).hexdigest()
-    thread_key = f"{channel}:{thread_ts}"
     if _LAST_APPROVAL_FINGERPRINT.get(thread_key) == fingerprint:
         logger.warning(
             "post_approval_request DEDUP: identical approval card already posted "
