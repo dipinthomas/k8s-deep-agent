@@ -225,11 +225,39 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
         if not tool_calls:
             text = self._extract_text(last)
             if self._looks_like_stand_down(text):
-                logger.info(
-                    "KeepLooping: AIMessage with empty tool_calls but text "
-                    "contains a stand-down phrase — recording explicit_stand_down=True"
+                # Only accept a text-based stand-down if the user already has
+                # Slack visibility via a prior post_to_slack call. If the agent
+                # is trying to stand down silently (without ever posting to Slack),
+                # reject it and demand post_to_slack first.
+                if self._tool_called_recently(messages, "post_to_slack"):
+                    logger.info(
+                        "KeepLooping: AIMessage with stand-down phrase and prior "
+                        "post_to_slack found — recording explicit_stand_down=True"
+                    )
+                    return {"explicit_stand_down": True}
+                logger.warning(
+                    "KeepLooping: stand-down text detected but post_to_slack was "
+                    "never called — user has no Slack visibility, rejecting stand-down"
                 )
-                return {"explicit_stand_down": True}
+                return {
+                    "messages": [
+                        HumanMessage(
+                            content=(
+                                "REJECTED: You wrote a stand-down message but you have "
+                                "NOT called post_to_slack yet. The user cannot see your "
+                                "reasoning. You MUST call post_to_slack first.\n\n"
+                                "If action IS required (e.g. inventory-sync-job is "
+                                "Running): follow the two-turn approval sequence — "
+                                "post_to_slack + post_approval_request now, then "
+                                "kubectl_scale alone next turn.\n\n"
+                                "If genuinely no action is needed: call post_to_slack "
+                                "with your stand-down explanation (containing 'no action "
+                                "required' or 'standing down'), then mark_stand_down "
+                                "on the next turn."
+                            )
+                        )
+                    ]
+                }
 
             logger.warning(
                 "KeepLooping: AIMessage ended turn with empty tool_calls and no "
@@ -258,76 +286,39 @@ class KeepLoopingMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
             }
 
         # Case 2 — post_approval_request was called but no destructive tool
-        # was queued in the same turn. The HITL gate has nothing to pause on,
-        # so the buttons would be no-ops. Inject corrective guidance.
+        # was queued in the same turn. This is the CORRECT two-turn pattern:
+        #   Turn N:   post_to_slack + post_approval_request  (Slack visible, no interrupt)
+        #   Turn N+1: kubectl_scale alone                    (HITL fires here)
+        # Do NOT treat this as an error. Send a directive so the model calls
+        # the destructive tool alone in the very next turn.
         if "post_approval_request" in tool_names:
             queued_destructive = [n for n in tool_names if n in self.destructive_tool_names]
             if not queued_destructive:
                 # Allow the case where the agent already recently executed a
                 # destructive tool via interrupt resume — i.e. an APPROVED
-                # action just ran and the agent is re-posting an updated
-                # approval block for the next step. We detect that by checking
-                # whether the most recent ToolMessage in history corresponds
-                # to a destructive tool that just succeeded.
+                # action just ran and the agent is in post-remediation state.
                 if self._destructive_just_executed(messages):
                     return {"unarmed_gate_retry_count": 0}
 
-                retry_count = int(state.get("unarmed_gate_retry_count") or 0)
-                next_count = retry_count + 1
-
-                if next_count > _MAX_UNARMED_GATE_RETRIES:
-                    # Escalation: the model has now failed `_MAX_UNARMED_GATE_RETRIES`
-                    # times to queue the destructive tool alongside post_approval_request.
-                    # Stop asking nicely — demand mark_stand_down so the loop terminates.
-                    logger.error(
-                        "KeepLooping: post_approval_request called without a "
-                        "destructive tool for the %dth consecutive turn — "
-                        "demanding mark_stand_down to terminate the loop",
-                        next_count,
-                    )
-                    return {
-                        "unarmed_gate_retry_count": next_count,
-                        "messages": [
-                            HumanMessage(
-                                content=(
-                                    f"STOP. You have called post_approval_request "
-                                    f"{next_count} times in a row WITHOUT queuing the "
-                                    "destructive kubectl tool in the same turn. The "
-                                    "approval gate cannot arm and Slack is being "
-                                    "spammed with duplicate approval cards.\n\n"
-                                    "Do NOT call post_approval_request again. Do NOT "
-                                    "call post_to_slack with another summary. Your "
-                                    "ONLY valid next action is:\n"
-                                    "  mark_stand_down(reason=\"Could not arm the "
-                                    "approval gate after repeated retries\")\n\n"
-                                    "Call mark_stand_down now. This is the only way "
-                                    "to end the loop cleanly."
-                                )
-                            )
-                        ],
-                    }
-
-                logger.warning(
-                    "KeepLooping: post_approval_request called without a "
-                    "destructive tool in the same turn (retry %d/%d) — injecting "
-                    "corrective HumanMessage so the gate can be armed",
-                    next_count, _MAX_UNARMED_GATE_RETRIES,
+                logger.info(
+                    "KeepLooping: post_approval_request called without destructive "
+                    "tool (expected two-turn pattern) — directing model to call "
+                    "the destructive tool alone in the next turn"
                 )
                 return {
-                    "unarmed_gate_retry_count": next_count,
+                    "unarmed_gate_retry_count": 0,
                     "messages": [
                         HumanMessage(
                             content=(
-                                "You called post_approval_request but did NOT queue "
-                                "the destructive kubectl tool in the SAME turn. The "
-                                "approval buttons in Slack are now no-ops because "
-                                "interrupt_on has nothing to pause on. Re-issue your "
-                                "tool calls now: call post_approval_request AND the "
-                                "exact destructive tool from your action_list "
-                                "(e.g. kubectl_delete pod ...) together in one "
-                                "response. Do not wait for an approval message — "
-                                "calling the destructive tool is what creates the "
-                                "pending interrupt."
+                                "✅ Approval card posted to Slack. "
+                                "Do NOT call post_approval_request or post_to_slack again. "
+                                "Your ONE next action: call the destructive kubectl tool "
+                                "from your action_list — alone, with no other tool calls "
+                                "in the same response. "
+                                "Example: kubectl_scale deployment/inventory-sync-job "
+                                "-n shop-prod --replicas=0\n"
+                                "The graph will pause at that tool call until the human "
+                                "clicks APPROVE or DENY."
                             )
                         )
                     ],

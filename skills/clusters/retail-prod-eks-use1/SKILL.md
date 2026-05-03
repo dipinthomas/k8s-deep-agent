@@ -8,10 +8,56 @@ description: Load this skill when operating against the retail-prod-eks-use1
 
 # Cluster Context: retail-prod-eks-use1 (EKS us-east-1)
 
-This is a **demo cluster** running a synthetic checkout workload in namespace
-`shop-prod` on EKS cluster `otel-demo-prod`. Latency and errors are generated
-by `latency-synthesizer` (no real business logic). Tier definitions still
-apply — treat services as production-critical during the investigation.
+---
+
+## ALARM RESPONSE: checkoutservice-p99-latency-high
+
+**When this alarm fires, follow this decision tree exactly:**
+
+**Step A — Check for the noisy neighbor (do this first):**
+```
+kubectl get pods -n shop-prod -l app=inventory-sync-job
+```
+
+**If that command returns a Running pod → investigation is COMPLETE. Root cause confirmed.**
+- `inventory-sync-job` is a CPU stress workload (stress-ng, no CPU limit) that saturates
+  the node and throttles the `latency-synthesizer` pod, causing checkoutservice latency.
+- You do NOT need CPU metric data or further evidence. Stop investigating.
+- **The target to scale is `inventory-sync-job`, NOT `checkoutservice`.**
+  `checkoutservice` is the VICTIM. `inventory-sync-job` is the CAUSE.
+  `checkoutservice` is NOT a Deployment — there is no `deployment/checkoutservice` to scale.
+- Action: TWO-TURN sequence:
+  Turn N: post_to_slack + post_approval_request (no destructive tool).
+  Turn N+1: kubectl_scale deployment/inventory-sync-job -n shop-prod --replicas=0 (alone).
+- Do NOT delete the pod — that restarts it. Scale the Deployment to 0.
+- Do NOT drain the node. Do NOT stand down.
+- Do NOT scale `checkoutservice` — it does not exist as a Deployment.
+
+See the universal noisy-neighbor skill for guidance on confusing signals
+(OTel 504s, karpenter annotations, missing kubectl top data, priority class
+not returned by subagent). Those are universal patterns — they apply here too.
+
+**If no inventory-sync-job pod is Running → check alarm state:**
+- If CloudWatch P99 < 300ms: false positive or already resolved. Stand down.
+- If CloudWatch P99 ≥ 300ms but no stress pod: `latency-synthesizer` is in software
+  spike mode only. Investigate further before acting.
+
+---
+
+## POD-TO-SERVICE MAPPING (read before looking for service pods)
+
+**There are NO pods named `checkoutservice`, `paymentservice`, `cartservice`, etc.**
+The alarm uses service names from CloudWatch metrics. Those services are NOT separate pods.
+
+| CloudWatch service dimension | Actual pod in cluster | Namespace |
+|---|---|---|
+| checkoutservice, paymentservice, cartservice, productcatalogservice, frontendservice | `latency-synthesizer` | `shop-prod` |
+| noisy-neighbor CPU culprit | `inventory-sync-job` | `shop-prod` |
+
+**Do NOT search for a pod named `checkoutservice` — it does not exist.**
+`latency-synthesizer` IS the checkoutservice (and all other services simultaneously).
+
+---
 
 ## Cluster Facts
 
@@ -22,9 +68,16 @@ apply — treat services as production-critical during the investigation.
   namespace `RetailProd/Services`
 - **Workload namespace:** `shop-prod`
 - **AWS Profile:** `fernhub`
-- **Slack channel:** `#retail-prod-incidents`
+- **Slack channel:** `#k8s-alerts`
 
 ## Workload
+
+**Important:** There is NO pod named `checkoutservice`, `paymentservice`, `cartservice`, etc.
+The `latency-synthesizer` pod is the single process that simulates ALL five services using
+per-service OTel TracerProviders. Do NOT search for individual service pods — they do not
+exist. When the checkoutservice alarm fires, the relevant pods in `shop-prod` are:
+- `latency-synthesizer` — the workload pod (always present)
+- `inventory-sync-job` — the noisy-neighbor culprit (present only during spike)
 
 Five "services" (a single Python process with per-service OTel TracerProviders)
 emit traces matching this call graph:
@@ -80,14 +133,14 @@ node and CPU-throttling `paymentservice`'s processing loops.
 
 **`checkoutservice-p99-latency-high`** — threshold 300ms, period 30s,
 2 evaluation periods. Fans out via SNS `retail-prod-incidents` to:
-- AWS Chatbot → Slack `#retail-prod-incidents` (alarm card)
+- AWS Chatbot → Slack `#k8s-alerts` (alarm card)
 - Lambda `retail-prod-alarm-to-agent` → POST `/trigger` on the agent
 
 ## Scenario Calibration and Stand-Down Rules
 
 The `latency-synthesizer` pod in `shop-prod` exposes its active scenario via
-the `SCENARIO` env var. This is expected on a demo cluster — it does NOT mean
-the incident is intentional or that no action is needed.
+the `SCENARIO` env var. The SCENARIO variable does NOT change the incident response rules.
+A Running `inventory-sync-job` always requires remediation regardless of SCENARIO.
 
 **Expected P99 by scenario (software only, no external CPU pressure):**
 
@@ -98,15 +151,30 @@ the incident is intentional or that no action is needed.
 
 ### When `inventory-sync-job` is Running: Action IS Required
 
-**If `inventory-sync-job` pod is present in `shop-prod` with replicas > 0,
-that is the noisy-neighbor.** It is a CPU stress workload (stress-ng) with no
-CPU limit that deliberately saturates the node. Its presence alongside an
-elevated P99 IS the incident — it is the root cause, not a symptom.
+**Decision rule (no exceptions):** if `kubectl get pods -n shop-prod -l app=inventory-sync-job`
+returns any pod in Running or Pending state, action is required. You do NOT need
+CPU metric data to confirm — the pod's presence with replicas > 0 IS the
+confirmation. `kubectl top` may show no data for a newly started pod (metrics
+server lags by 2-3 minutes); that lag does not change the decision.
 
-- Do NOT conclude "expected load-test behavior" when `inventory-sync-job` is Running.
+It is a CPU stress workload (stress-ng) with no CPU limit that saturates the
+node. Its presence alongside an elevated P99 IS the incident — it is the root
+cause, not a symptom.
+
+**If `kubectl top` fails or returns no data:** this is expected for a pod that
+started recently. Confidence is still **High**. In the post_to_slack message,
+use this exact bullet for the confidence line:
+`• *Confidence:* High — pod presence alongside elevated P99 is definitive per cluster runbook`
+Do NOT write "likely", "probable", "suspected", or "if this aligns" — the presence
+of a Running `inventory-sync-job` IS the confirmation. Express it as confirmed fact.
+
+- Do NOT conclude "not enough evidence" when `inventory-sync-job` is Running.
+- Do NOT express uncertainty about root cause when `inventory-sync-job` is Running.
 - Do NOT stand down without posting an approval request.
-- The correct action is: post findings + `post_approval_request` + queue
-  `kubectl_scale deployment/inventory-sync-job -n shop-prod --replicas=0` in the same turn.
+- Do NOT drain the node — the entire node is not the problem.
+- The correct action is the two-turn approval sequence:
+  Turn N: post_to_slack (findings) + post_approval_request (approval card) — no destructive tool.
+  Turn N+1: kubectl_scale deployment/inventory-sync-job -n shop-prod --replicas=0 — alone.
   **Do NOT delete the individual pod** — `inventory-sync-job` is a Deployment and will
   immediately restart if you delete the pod. Scale the Deployment to 0 replicas instead.
 
@@ -157,14 +225,19 @@ kubectl get pod -n shop-prod -l app=inventory-sync-job \
 ```
 Expected: `low-priority` — confirms it is safe to evict.
 
-### Step 5 — Approval request + remediation
-Post findings to Slack, then issue `post_approval_request` AND the
-scale call in the same turn:
+### Step 5 — Approval request + remediation (TWO TURNS)
+Turn N — call both in one response, no destructive tool:
+- post_to_slack (findings summary using the template below)
+- post_approval_request (approval card)
+
+The middleware will reply "✅ Approval card posted."
+
+Turn N+1 — call the destructive tool ALONE:
 ```
 kubectl_scale deployment/inventory-sync-job -n shop-prod --replicas=0
 ```
 **Do NOT delete the individual pod** — deleting a Deployment's pod just restarts it.
-Scale the Deployment to 0 so the stress workload stops entirely.
+**Do NOT include post_to_slack or post_approval_request in Turn N+1** — call kubectl_scale alone.
 
 After scaling, verify: `kubectl top pods -n shop-prod` should show CPU
 returning to baseline within 30s. Check CloudWatch P99 returning below
@@ -183,11 +256,62 @@ returning to baseline within 30s. Check CloudWatch P99 returning below
 2. Other low-priority workloads in `shop-prod`
 3. **STOP.** Anything user-facing or critical requires explicit human approval.
 
-Prefer `kubectl_scale deployment/<name> -n shop-prod --replicas=0` over pod delete or node drain.
+Use `kubectl_scale deployment/<name> -n shop-prod --replicas=0`. Do not delete the pod (Deployment restarts it immediately).
 Pod delete alone does not stop a Deployment — it restarts immediately.
 
 ## Slack and Approval
 
-- Alarms post to `#retail-prod-incidents` via AWS Chatbot.
+- Alarms post to `#k8s-alerts-new` via AWS Chatbot.
 - Agent posts investigation updates and approval requests in the same channel.
-- Approval contact: on-call engineer in `#retail-prod-incidents`.
+- Approval contact: on-call engineer in `#k8s-alerts-new`.
+
+## Slack Message Templates
+
+Use EXACTLY these formats. Do not add extra headers, narrative prose, or
+sections beyond what is shown below.
+
+### post_to_slack — investigation findings
+
+Call this FIRST (before post_approval_request) in Turn N.
+Fill in the `{placeholders}` with real values from subagent reports:
+
+```
+:rotating_light: *checkoutservice | P99 {measured_p99}ms* — threshold 300ms breached
+
+*Root cause* — `inventory-sync-job` Running in `shop-prod`
+Stress-ng workload (no CPU limit) saturating node CPU, throttling the payment processing loops.
+
+*Why it's safe to stop* — `inventory-sync-job` is PriorityClass `low-priority` (value 100). Critical services (`checkoutservice`, `paymentservice`) run at PriorityClass `payment-critical` (value 1,000,000). Stopping the lowest-priority workload has zero impact on checkout.
+
+*Impact* — checkoutservice and paymentservice latency elevated · no errors · no data loss
+*Fix* — scale `inventory-sync-job` to 0 · approval request below ↓
+
+━━━━━━━━━━━━━━━━━━━━━
+:mag: *Investigation details*
+
+• *CloudWatch:* checkoutservice P99 {measured_p99}ms · paymentservice P99 {pay_p99}ms · alarm fired {alarm_time} UTC
+• *Node:* `{node}` — `inventory-sync-job` and `latency-synthesizer` co-located on this node
+• *Priority class:* `inventory-sync-job` → `low-priority` (100) · `checkoutservice` → `payment-critical` (1,000,000)
+• *OTel:* Latency spike on payment path · cartservice and productcatalogservice within normal range
+• *Confidence:* High — Running pod + priority class + elevated P99 are definitive per runbook
+```
+
+Keep all verbose detail BELOW the `━━━` line — Slack collapses long sections
+with a "Show more" link so the summary above stays visible without scrolling.
+
+**Format rules for the verbose section:**
+- Every item MUST be a `•` bullet using `• *Label:* value` format — no prose paragraphs.
+- The five bullet labels are fixed: CloudWatch, Node, Priority class, OTel, Confidence.
+- If a subagent did not return the priority class, substitute the documented value:
+  `inventory-sync-job` → `low-priority` (100) · `checkoutservice` → `payment-critical` (1,000,000).
+  Never write "not reported by tools" — the cluster skill is the authoritative source.
+
+
+### post_approval_request — fill fields as follows (one line each)
+
+Call this SECOND (after post_to_slack) in the SAME Turn N. NOT in Turn N+1.
+
+- `summary`: `inventory-sync-job Running — confirmed noisy neighbour causing CPU saturation`
+- `evidence`: `See investigation details above ↑`
+- `action_list`: `kubectl scale deployment/inventory-sync-job -n shop-prod --replicas=0`
+- `impact`: `Stops stress workload · P99 expected back below 100ms within 60s`

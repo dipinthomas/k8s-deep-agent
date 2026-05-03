@@ -6,7 +6,6 @@ metadata:
   labels:
     app: inventory-sync-job
     app.kubernetes.io/part-of: retail-prod-demo-workload
-    app.kubernetes.io/component: noisy-neighbor
 spec:
   replicas: 0      # ./demo healthy keeps this at 0; ./demo spike scales to 1
   selector:
@@ -16,7 +15,6 @@ spec:
     metadata:
       labels:
         app: inventory-sync-job
-        app.kubernetes.io/component: noisy-neighbor
       annotations:
         # Prevent Karpenter from consolidating the node while the stress pod is
         # running — consolidation would reschedule it elsewhere, breaking co-location.

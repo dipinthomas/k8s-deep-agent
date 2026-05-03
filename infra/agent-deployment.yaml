@@ -102,7 +102,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v46
+        image: dipinthomas2003/k8s-deep-agent:v61
         imagePullPolicy: Always
         envFrom:
         - secretRef:

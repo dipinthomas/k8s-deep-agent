@@ -72,6 +72,15 @@ Parameters:
     Default: ''
     Description: Slack channel ID (Cxxxxxxxx). Required if SlackWorkspaceId is set.
 
+  ChatbotConfigVersion:
+    Type: String
+    Default: 'v1'
+    Description: >
+      Increment (v2, v3, …) to force-recreate the Chatbot channel configuration.
+      Chatbot threads all state-changes for an alarm under its first message;
+      recreation clears that thread memory so the next alarm posts a fresh
+      top-level card. Change this before each demo run if you need a clean slate.
+
 Conditions:
   EnableChatbot: !Not [!Equals [!Ref SlackWorkspaceId, '']]
 
@@ -346,7 +355,7 @@ Resources:
     Type: AWS::Chatbot::SlackChannelConfiguration
     Condition: EnableChatbot
     Properties:
-      ConfigurationName: retail-prod-incidents
+      ConfigurationName: !Sub 'retail-prod-${ChatbotConfigVersion}'
       SlackWorkspaceId: !Ref SlackWorkspaceId
       SlackChannelId: !Ref SlackChannelId
       IamRoleArn: !GetAtt ChatbotRole.Arn

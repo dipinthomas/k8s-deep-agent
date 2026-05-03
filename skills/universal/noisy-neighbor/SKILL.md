@@ -62,16 +62,58 @@ Post to Slack with:
   memory with units)
 - Victim pods affected, with explicit call-out for any critical-tier
   services
-- Priority class of the culprit (justifies eviction)
+- Priority class of the culprit and the victim — the contrast between
+  a low-priority batch workload and a critical-tier service is the key
+  justification for the action
 - Expected outcome after eviction (resource pressure drops, victim
-  metrics recover)
-- Statement that critical-tier services are protected (list them from the
-  cluster skill)
+  metrics recover within ~60s)
 - APPROVE / DENY buttons via `post_approval_request`
 
-### Step 7 — Remediation: prefer pod delete over drain
-Same rationale as `node-disk-pressure` — issue
-`kubectl_delete pod <name> -n <namespace>` for the culprit. The controller
-reschedules it; if it lands on the same node and immediately re-saturates,
-escalate by proposing scale-down or resource-limit changes via a fresh
-approval gate.
+### Step 7 — Remediation: scale the culprit Deployment to 0 (preferred)
+For Deployment-managed culprits (any pod whose ownerReference is a Deployment),
+use `kubectl_scale deployment/<name> -n <namespace> --replicas=0` — NOT pod
+delete. Deleting a Deployment's pod just restarts it on the same node immediately.
+
+If the culprit is a bare pod with no controller, use
+`kubectl_delete pod <name> -n <namespace>` instead.
+
+Check the cluster skill: it may name the culprit explicitly, confirm the safe
+action, and specify whether CPU metric data is required or pod presence alone
+is sufficient to justify action.
+
+---
+
+## Handling Confusing Evidence (applies to any cluster)
+
+These are common signals that look contradictory but are actually consistent
+with a noisy-neighbor CPU saturation root cause. Do NOT let them override a
+confirmed culprit pod identified by the cluster skill's decision tree.
+
+### OTel / application-layer 504s and timeout errors
+When a CPU-bound workload (e.g. a stress-ng batch job) saturates a node, it
+CPU-throttles any co-located pod that does CPU-intensive work (processing loops,
+cryptography, serialization). This causes those pods to stall internally, which
+cascades into downstream 504 Gateway Timeout errors visible in OTel traces.
+
+**504s on the checkout or payment path ARE consistent with CPU throttle from a
+noisy-neighbor — they are NOT evidence of a separate root cause.**
+Do not interpret checkout-path timeouts as pointing to a dependency network
+issue when a high-CPU batch job is confirmed Running on the same node.
+
+### `karpenter.sh/do-not-disrupt: "true"` annotation
+This annotation instructs Karpenter NOT to evict or consolidate the pod during
+node lifecycle operations. It has **no effect on `kubectl scale`**. You can
+scale the Deployment to 0 replicas regardless of this annotation — `kubectl scale`
+bypasses Karpenter entirely and writes directly to the Deployment spec.
+
+### `kubectl top` shows no data or the call fails
+The metrics-server has a 2–3 minute lag for newly started pods. If `kubectl top`
+returns no data or fails for the suspect pod, this is expected and does NOT mean
+the pod is not consuming CPU. If the cluster skill states that pod presence alone
+is sufficient evidence (e.g. a known stress workload), treat missing `kubectl top`
+data as a metrics-server lag, not as "insufficient evidence."
+
+### Priority class not returned by the subagent
+If the subagent's `kubectl` output did not include priority class information,
+use the values documented in the cluster skill. Do not treat a missing priority
+class as a reason to delay action — the cluster skill's tier table is authoritative.

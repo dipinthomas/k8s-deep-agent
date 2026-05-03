@@ -80,11 +80,13 @@ def post_to_slack(message: str, config: RunnableConfig) -> str:
     return f"Slack error: {err}" if err else f"Posted to Slack thread (ts={ts})"
 
 
-# This tool ONLY posts the APPROVE/DENY buttons to Slack — it does NOT pause
-# the graph. The pause is created by interrupt_on when a destructive kubectl
-# tool is actually called. The agent MUST follow this tool, in the same turn,
-# with the destructive tool call described in action_list. Otherwise the
-# buttons are no-ops (nothing pending to resume).
+# This tool posts the APPROVE/DENY buttons to Slack. Call it TOGETHER with
+# post_to_slack (findings) in one turn — no destructive tool in this turn.
+# The middleware will then direct you to call the destructive tool ALONE in
+# the very next turn, where interrupt_on will pause the graph for human review.
+# Two-turn sequence:
+#   Turn N:   post_to_slack + post_approval_request  (visible in Slack, no interrupt)
+#   Turn N+1: kubectl_scale alone                    (HITL fires, graph pauses)
 @tool
 def post_approval_request(
     summary: str,
@@ -96,26 +98,26 @@ def post_approval_request(
     """
     Post the APPROVE / DENY / MORE DETAILS buttons to the investigation thread.
 
-    IMPORTANT — this tool does NOT pause the agent and does NOT wait for the
-    human. It is just a Slack post. The actual human-in-the-loop pause is
-    created by interrupt_on when you call the destructive kubectl tool.
+    IMPORTANT — TWO-TURN SEQUENCE REQUIRED:
+    1. Call post_to_slack (findings) AND this tool in the SAME turn. Do NOT
+       include the destructive kubectl tool in this turn.
+    2. The middleware will respond "✅ Approval card posted." After that, call
+       the destructive kubectl tool ALONE in the NEXT turn. The graph will
+       pause at that tool call until the human clicks a button.
 
-    REQUIRED USAGE: in the SAME turn that you call this tool, you MUST also
-    call the destructive kubectl tool you described in `action_list` (e.g.
-    kubectl_delete with the exact pod/namespace from action_list). The graph
-    will pause at THAT tool call until the human clicks a button. If you end
-    your turn after calling post_approval_request without queuing the
-    destructive tool, the APPROVE/DENY buttons will be no-ops.
+    Why two turns? LangGraph's interrupt_on fires before parallel tool siblings
+    can execute, which would strand this Slack post. The two-turn pattern
+    guarantees the approval card is visible before the graph pauses.
 
     The channel and thread are determined automatically — do NOT supply them.
 
     Args:
-        summary:     1-2 sentence root cause summary
-        evidence:    Key metrics and findings (mrkdwn)
-        action_list: Ranked list of actions to take (lowest risk first).
-                     You MUST call the top action's kubectl tool next, in this
-                     same turn.
-        impact:      What will be affected by the actions
+        summary:     1-2 sentence root cause summary (e.g. "inventory-sync-job Running — confirmed noisy neighbour")
+        evidence:    Put ONLY "See investigation details above ↑" — do NOT repeat
+                     metrics or kubectl output already posted via post_to_slack.
+        action_list: The single kubectl command to execute (e.g. "kubectl scale deployment/inventory-sync-job -n shop-prod --replicas=0").
+                     Call that kubectl tool ALONE in the NEXT turn (not this one).
+        impact:      One line: expected outcome + recovery time (e.g. "Stops stress workload · P99 back below 100ms within 60s")
     """
     channel, thread_ts = _route(config)
 
@@ -148,9 +150,8 @@ def post_approval_request(
             "text": {"type": "plain_text", "text": "⚠️  Approval Required", "emoji": True},
         },
         {"type": "section", "text": {"type": "mrkdwn", "text": f"*Root cause:*\n{summary}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Evidence:*\n{evidence}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Recommended actions:*\n{action_list}"}},
-        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Impact:*\n{impact}"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Action:*\n`{action_list}`"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": f"*Expected outcome:*\n{impact}"}},
         {"type": "divider"},
         {
             "type": "actions",

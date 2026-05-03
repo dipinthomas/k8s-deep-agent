@@ -71,19 +71,101 @@ case "${1:-}" in
       --query 'Attributes.ApproximateNumberOfMessages' --output text
     ;;
   test-alarm)
-    # Force the alarm into ALARM state once, to smoke-test the SNS->Lambda->agent path
-    # without waiting for a real spike.
+    # Force the alarm into ALARM state with a realistic-looking reason.
+    T1=$(date -u +"%d/%m/%y %H:%M:%S")
+    T2=$(date -u -v-30S +"%d/%m/%y %H:%M:%S" 2>/dev/null || \
+         date -u -d '30 seconds ago' +"%d/%m/%y %H:%M:%S" 2>/dev/null || echo "$T1")
     aws cloudwatch set-alarm-state \
       --alarm-name checkoutservice-p99-latency-high \
       --state-value ALARM \
-      --state-reason "manual smoke test from ./demo test-alarm at $(date -u +%FT%TZ)" \
+      --state-reason "Threshold Crossed: 2 datapoints [1456.3 ($T2), 1389.7 ($T1)] were greater than the threshold (300.0)." \
       --region "$AWS_REGION"
-    echo "→ Alarm forced to ALARM. Watch:"
-    echo "    ./demo lambda-logs       # for the Lambda invocation"
-    echo "    Slack #retail-prod-incidents for Chatbot card + agent ack"
+    echo "→ Alarm in ALARM state. Watch #k8s-alerts-new for Amazon Q card + agent thread."
+    ;;
+  test-full)
+    # Fire ALARM then OK so you can watch both the open and close cards in Slack.
+    T1=$(date -u +"%d/%m/%y %H:%M:%S")
+    T2=$(date -u -v-30S +"%d/%m/%y %H:%M:%S" 2>/dev/null || \
+         date -u -d '30 seconds ago' +"%d/%m/%y %H:%M:%S" 2>/dev/null || echo "$T1")
+    aws cloudwatch set-alarm-state \
+      --alarm-name checkoutservice-p99-latency-high \
+      --state-value ALARM \
+      --state-reason "Threshold Crossed: 2 datapoints [1456.3 ($T2), 1389.7 ($T1)] were greater than the threshold (300.0)." \
+      --region "$AWS_REGION"
+    echo "→ ALARM fired. Waiting 30s then resolving..."
+    sleep 30
+    T1=$(date -u +"%d/%m/%y %H:%M:%S")
+    T2=$(date -u -v-30S +"%d/%m/%y %H:%M:%S" 2>/dev/null || \
+         date -u -d '30 seconds ago' +"%d/%m/%y %H:%M:%S" 2>/dev/null || echo "$T1")
+    aws cloudwatch set-alarm-state \
+      --alarm-name checkoutservice-p99-latency-high \
+      --state-value OK \
+      --state-reason "Threshold Crossed: 2 datapoints [24.1 ($T2), 31.8 ($T1)] were not greater than the threshold (300.0)." \
+      --region "$AWS_REGION"
+    echo "→ OK fired. Watch #k8s-alerts-new for the resolution card."
+    ;;
+  reset-chatbot)
+    # AWS Chatbot tracks threads server-side (per alarm name + channel).
+    # Deleting/recreating the Chatbot config does NOT clear thread state.
+    # The only way to get a fresh top-level Amazon Q card is to delete the
+    # last Amazon Q message from #k8s-alerts — after which the next alarm
+    # creates a new top-level message.
+    #
+    # This command finds the most recent Amazon Q card and prints its
+    # Slack ts so you can delete it manually (or auto-deletes if the bot
+    # has admin permissions).
+    SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-$(kubectl get secret k8s-agent-secrets \
+      -n k8s-agent -o jsonpath='{.data.SLACK_BOT_TOKEN}' 2>/dev/null | base64 -d)}"
+    CHANNEL="${SLACK_CHANNEL_ID:-$(kubectl get secret k8s-agent-secrets \
+      -n k8s-agent -o jsonpath='{.data.SLACK_CHANNEL_ID}' 2>/dev/null | base64 -d)}"
+
+    echo "→ Looking for Amazon Q bot messages in #k8s-alerts-new..."
+    HISTORY=$(curl -s "https://slack.com/api/conversations.history" \
+      -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+      --data-urlencode "channel=$CHANNEL" \
+      --data-urlencode "limit=50")
+
+    # Amazon Q Chatbot bot user ID — messages with no text and blocks from AWS Chatbot
+    MSGS=$(echo "$HISTORY" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data.get('messages', []):
+    # Amazon Q messages have 'bot_id' set by AWS Chatbot and no plain text
+    bot_id = m.get('bot_id','') or m.get('username','')
+    if 'AWS' in str(m.get('username','')) or 'Amazon' in str(m.get('username','')) \
+       or (m.get('bot_id') and not m.get('text')):
+        print(m['ts'])
+" 2>/dev/null)
+
+    if [[ -z "$MSGS" ]]; then
+      # Fallback: list recent non-agent messages
+      echo "   Could not auto-detect Amazon Q messages."
+      echo "   Manually delete the most recent Amazon Q alarm card from #k8s-alerts."
+      echo "   (hover over the message → ⋮ → Delete message)"
+    else
+      FIRST_TS=$(echo "$MSGS" | head -1)
+      # Try to delete — succeeds only if the bot has admin permissions
+      RESULT=$(curl -s "https://slack.com/api/chat.delete" \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"channel\":\"$CHANNEL\",\"ts\":\"$FIRST_TS\"}")
+      if echo "$RESULT" | grep -q '"ok":true'; then
+        echo "   ✓ Deleted Amazon Q message (ts=$FIRST_TS). Chatbot will post fresh next alarm."
+      else
+        ERROR=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null)
+        echo "   ✗ Cannot auto-delete ($ERROR — bot lacks admin permissions)."
+        echo ""
+        echo "   Manual step required:"
+        echo "   1. Open #k8s-alerts in Slack"
+        echo "   2. Find the Amazon Q card with ts ≈ $FIRST_TS"
+        echo "      (the most recent '🚨 CloudWatch Alarm' card from Amazon Q)"
+        echo "   3. Hover → ⋮ → Delete message"
+        echo "   4. Run ./demo test-alarm — Chatbot will post a fresh card"
+      fi
+    fi
     ;;
   *)
-    echo "Usage: $0 {healthy|spike|reset|status|logs|lambda-logs|dlq|test-alarm}"
+    echo "Usage: $0 {healthy|spike|reset|status|logs|lambda-logs|dlq|test-alarm|test-full|reset-chatbot}"
     exit 1
     ;;
 esac
