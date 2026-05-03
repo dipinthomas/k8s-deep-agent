@@ -18,6 +18,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from subagents import build_subagents
 from tools.slack_tools import post_to_slack, post_approval_request
+from tools.memory_tools import save_incident_to_memory
 from memory.store import build_memory_store_async, seed_memory_store
 from mcp_servers.mcp_client import get_mcp_tools_async
 from middleware import KeepLoopingMiddleware
@@ -156,7 +157,8 @@ approval card is visible before the graph pauses.
 
 AFTER THE GATE
 - APPROVE → the gated tool already ran and its result is in your context.
-  On success: post_to_slack with the outcome, then mark_stand_down.
+  On success: post_to_slack with the outcome, then save_incident_to_memory,
+  then mark_stand_down.
   On error ("Tool error: ..."): RE-PLAN. Pick a different tool or retry
   with corrective flags (e.g. `--force --delete-emptydir-data
   --ignore-daemonsets` for drain), then re-run the gate (a)+(b)+(c) in
@@ -214,7 +216,8 @@ NON-NEGOTIABLE
 - Evidence + approval UI BEFORE the destructive tool.
 - Destructive tool in the SAME turn as post_approval_request.
 - Re-plan on tool error, never summarise-and-stop.
-- Write the outcome to long-term memory after resolution.
+- Call save_incident_to_memory BEFORE mark_stand_down on every successful
+  resolution. This is how the agent learns across incidents.
 - If unsure, ask.
 """
 
@@ -429,6 +432,7 @@ async def build_agent_async():
             post_to_slack,
             post_approval_request,
             mark_stand_down,
+            save_incident_to_memory,
             *mcp_tools,
         ],
         middleware=[
@@ -450,9 +454,3 @@ async def build_agent_async():
     )
 
     return agent
-
-
-def build_agent():
-    """Synchronous shim for backwards compatibility. Prefer build_agent_async()."""
-    import asyncio
-    return asyncio.run(build_agent_async())

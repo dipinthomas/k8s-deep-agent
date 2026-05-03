@@ -1,7 +1,7 @@
 """
 Token-cost optimization middleware and helpers.
 
-Three concerns live here, all aimed at cutting input-token spend without
+Two concerns live here, both aimed at cutting input-token spend without
 touching the agent graph, interrupt machinery, or KeepLoopingMiddleware:
 
 1. TokenUsageLoggingMiddleware — wraps every model call and logs LangChain's
@@ -15,11 +15,6 @@ touching the agent graph, interrupt machinery, or KeepLoopingMiddleware:
    responses can be 10–50 KB; the LLM rarely needs more than the first few
    KB. We keep head + tail with a marker in the middle so the model still
    sees structure but stops paying for replays of full dumps every turn.
-
-3. filter_mcp_tools_for_subagent() — given the full MCP tool list and a
-   subagent role, return only the tools that subagent actually needs. The
-   cloudwatch-investigator does not need kubectl tools and vice versa;
-   filtering cuts ~30k tokens of schema overhead per subagent invocation.
 """
 
 from __future__ import annotations
@@ -27,7 +22,6 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from typing import Any
 
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -147,71 +141,3 @@ def truncate_tool_output(
     )
     return f"{head}{marker}{tail}"
 
-
-# ── 3. Per-subagent MCP tool filtering ────────────────────────────────────────
-
-# Keyword patterns that classify a tool as belonging to a logical domain.
-# Match is by lowercase substring on tool name + description. We err on the
-# side of inclusion; missing a tool is worse than carrying an extra one.
-_KUBECTL_KEYWORDS = (
-    "kubectl", "kube_", "k8s_", "pod", "namespace", "node",
-    "deployment", "service", "ingress", "statefulset", "daemonset",
-    "configmap", "secret", "rbac", "scale", "rollout", "drain", "evict",
-)
-_CLOUDWATCH_KEYWORDS = (
-    "cloudwatch", "metric", "alarm", "log", "logs_insight",
-    "container_insight", "describe_alarm", "get_metric",
-)
-_OTEL_KEYWORDS = _CLOUDWATCH_KEYWORDS  # OTel data flows through CloudWatch
-
-
-def _tool_matches(tool: Any, keywords: tuple[str, ...]) -> bool:
-    name = (getattr(tool, "name", "") or "").lower()
-    desc = (getattr(tool, "description", "") or "").lower()
-    return any(kw in name or kw in desc for kw in keywords)
-
-
-def filter_mcp_tools_for_subagent(
-    mcp_tools: list[Any], role: str
-) -> list[Any]:
-    """Filter the full MCP tool list down to the subset a subagent needs.
-
-    role:
-      - "kubectl"     → kubectl-mcp tools only
-      - "cloudwatch"  → cloudwatch-mcp tools only
-      - "otel"        → cloudwatch tools (OTel data is in CloudWatch)
-      - anything else → returns the full list unchanged
-
-    The master agent always gets the full list. This filter is for
-    subagents only.
-    """
-    if not mcp_tools:
-        return mcp_tools
-
-    keywords: tuple[str, ...] | None
-    if role == "kubectl":
-        keywords = _KUBECTL_KEYWORDS
-    elif role == "cloudwatch":
-        keywords = _CLOUDWATCH_KEYWORDS
-    elif role == "otel":
-        keywords = _OTEL_KEYWORDS
-    else:
-        return mcp_tools
-
-    filtered = [t for t in mcp_tools if _tool_matches(t, keywords)]
-    dropped = len(mcp_tools) - len(filtered)
-    logger.info(
-        "Subagent[%s] tool filter: kept %d / %d MCP tools (dropped %d)",
-        role, len(filtered), len(mcp_tools), dropped,
-    )
-    # Defensive: if the filter accidentally drops everything (e.g. tool
-    # naming scheme changed), fall back to the full list rather than
-    # ship a subagent with no tools.
-    if not filtered:
-        logger.warning(
-            "Subagent[%s] tool filter returned 0 tools — falling back to "
-            "full MCP tool list. Update keyword patterns in optimization.py.",
-            role,
-        )
-        return mcp_tools
-    return filtered
