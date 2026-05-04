@@ -102,7 +102,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v62
+        image: dipinthomas2003/k8s-deep-agent:v65
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -133,6 +133,8 @@ spec:
         #   permitting unbounded loops.
         - name: SUBAGENT_MODEL_CALL_LIMIT
           value: "15"
+        - name: STREAM_TIMEOUT_SEC
+          value: "600"
         #   Output token cap restored to the pre-v35 default. 2048 was
         #   chopping legitimate enumerate-and-propose turns mid-tool-call.
         - name: ANTHROPIC_MAX_TOKENS

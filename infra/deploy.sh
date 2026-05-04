@@ -202,6 +202,7 @@ kubectl rollout status deployment/agent-redis -n "$AGENT_NAMESPACE" --timeout=18
 ok "Redis running"
 
 kubectl apply -f "$SECRETS_FILE" || die "Failed to apply agent secrets"
+kubectl apply -f "$SCRIPT_DIR/phoenix-deployment.yaml" || die "Failed to apply Phoenix observability"
 kubectl apply -f "$SCRIPT_DIR/agent-deployment.yaml" || die "Failed to apply agent deployment"
 kubectl apply -f "$SCRIPT_DIR/mcp-gateway-deployment.yaml" || die "Failed to apply MCP gateway"
 
@@ -218,6 +219,10 @@ ok "Agent running"
 AGENT_HOST=$(kubectl get svc k8s-agent -n "$AGENT_NAMESPACE" \
   -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
 AGENT_TRIGGER_URL="${AGENT_HOST:+http://${AGENT_HOST}:8080/trigger}"
+
+PHOENIX_HOST=$(kubectl get svc phoenix -n "$AGENT_NAMESPACE" \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+PHOENIX_UI_URL="${PHOENIX_HOST:+http://${PHOENIX_HOST}:6006}"
 
 # ── Smoke test ────────────────────────────────────────────────────────────────
 echo ""
@@ -237,6 +242,7 @@ echo ""
 echo "  Cluster:    $CLUSTER ($REGION)"
 echo "  Stacks:     $CLUSTER_STACK, $IAM_STACK"
 echo "  Agent URL:  ${AGENT_TRIGGER_URL:-<NLB still provisioning — re-check with: kubectl get svc k8s-agent -n $AGENT_NAMESPACE>}"
+echo "  Phoenix UI: ${PHOENIX_UI_URL:-<NLB still provisioning — re-check with: kubectl get svc phoenix -n $AGENT_NAMESPACE>}"
 echo ""
 echo "  Logs:       kubectl logs -n $AGENT_NAMESPACE deployment/k8s-agent -f"
 echo "  Trigger:    curl -X POST \$AGENT_URL -H 'content-type: application/json' -d '{}'"

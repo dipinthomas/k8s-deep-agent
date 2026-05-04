@@ -41,61 +41,82 @@ def _post_eval_to_phoenix(
     span_id: str | None,
     project_name: str,
 ) -> None:
-    """Post a single EvalResult as a span annotation to Phoenix.
-    No-ops silently if Phoenix is not available or span_id is unknown.
+    """Post a single EvalResult as a span annotation to Phoenix via REST.
+
+    Uses httpx directly — the phoenix.client Python package is not required.
+    No-ops silently if Phoenix is unreachable or span_id is unknown.
     """
     if not span_id:
         return
-
     try:
-        import pandas as pd
-        from phoenix.client import Client
-        from phoenix.client.types import SpanEvaluations
-
-        client = Client(base_url=_PHOENIX_BASE)
-        df = pd.DataFrame({
-            "span_id": [span_id],
-            "label": [eval_result.label],
-            "score": [eval_result.score],
-            "explanation": [eval_result.explanation],
-        })
-        client.log_evaluations(
-            SpanEvaluations(
-                eval_name=eval_result.name,
-                dataframe=df,
-            ),
-            project_name=project_name,
+        import httpx
+        resp = httpx.post(
+            f"{_PHOENIX_BASE}/v1/span_annotations",
+            json={"data": [{
+                "span_id": span_id,
+                "name": eval_result.name,
+                "annotator_kind": "CODE",
+                "result": {
+                    "label": eval_result.label,
+                    "score": float(eval_result.score),
+                    "explanation": eval_result.explanation,
+                },
+            }]},
+            timeout=10,
         )
+        resp.raise_for_status()
         logger.debug("Posted eval %s (%s) to Phoenix span %s", eval_result.name, eval_result.label, span_id)
-    except ImportError:
-        logger.debug("phoenix.client not available — skipping Phoenix annotation")
     except Exception:
         logger.debug("Phoenix annotation failed for eval %s", eval_result.name, exc_info=True)
 
 
-def _get_root_span_id(thread_ts: str, project_name: str) -> str | None:
+def _get_root_span_id(thread_ts: str, project_name: str, retries: int = 4, retry_delay: float = 3.0) -> str | None:
     """Query Phoenix for the root span of the investigation identified by thread_ts.
-    Returns the span_id string, or None if not found / Phoenix not available.
-    """
-    try:
-        from phoenix.client import Client
 
-        client = Client(base_url=_PHOENIX_BASE)
-        # Phoenix supports simple filter expressions on span attributes.
-        # LangChainInstrumentor sets thread_id from the LangGraph configurable.
-        df = client.get_spans_dataframe(
-            project_name=project_name,
-            filter_condition=f'metadata["thread_id"] == "{thread_ts}"',
-        )
-        if df is None or df.empty:
-            logger.debug("No Phoenix spans found for thread_ts=%s", thread_ts)
-            return None
-        # The root span has no parent (parent_id is null/empty)
-        root = df[df.get("parent_id", "").isna() | (df.get("parent_id", "") == "")]
-        if root.empty:
-            root = df  # fall back to the first span if parent filtering fails
-        return str(root.iloc[0].name)  # span_id is the DataFrame index
-    except ImportError:
+    Uses the REST API directly because the Python client filter syntax changed
+    across Phoenix versions. The LangChainInstrumentor stores thread_ts in
+    session.id (top-level) and metadata.thread_id (attribute) — we match both.
+
+    Retries with a delay because the OTel exporter is async — the current
+    investigation's spans may not be flushed to Phoenix at the moment evals run.
+    Without retries, the function can find an older span from a previous
+    investigation that shared the same thread_ts (e.g. after an agent restart).
+    """
+    import time
+
+    def _find_root(spans: list) -> str | None:
+        # Find root spans (no parent) whose session.id or metadata.thread_id matches thread_ts.
+        # Phoenix returns spans newest-first; the first matching root span is the current one.
+        for span in spans:
+            attrs = span.get("attributes", {})
+            session_id = attrs.get("session.id", "") or ""
+            meta_thread = attrs.get("metadata.thread_id", "") or ""
+            if thread_ts not in (session_id, meta_thread):
+                continue
+            if span.get("parent_id") is None:
+                return span["context"]["span_id"]
+        return None
+
+    try:
+        import httpx
+        url = f"{_PHOENIX_BASE}/v1/projects/{project_name}/spans"
+
+        for attempt in range(retries):
+            if attempt > 0:
+                time.sleep(retry_delay)
+            try:
+                resp = httpx.get(url, params={"limit": 200}, timeout=10)
+                resp.raise_for_status()
+                spans = resp.json().get("data", [])
+            except Exception:
+                logger.debug("Phoenix span query failed (attempt %d)", attempt + 1, exc_info=True)
+                continue
+
+            span_id = _find_root(spans)
+            if span_id:
+                return span_id
+            logger.debug("No Phoenix root span for thread_ts=%s (attempt %d/%d)", thread_ts, attempt + 1, retries)
+
         return None
     except Exception:
         logger.debug("Failed to look up root span for thread_ts=%s", thread_ts, exc_info=True)

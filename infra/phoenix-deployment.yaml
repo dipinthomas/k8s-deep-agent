@@ -5,31 +5,15 @@
 # the agent pod reaches it via cluster-local DNS:
 #   http://phoenix.k8s-agent.svc.cluster.local:6006/v1/traces
 #
+# Storage: emptyDir — traces live for the lifetime of the pod.
+# Fine for demos. For persistent traces across restarts, provision an EBS
+# volume manually and switch to a PVC backed by the cluster's CSI driver.
+#
 # Apply:
 #   kubectl apply -f infra/phoenix-deployment.yaml
 #
-# Then enable tracing in the agent secret/env:
-#   PHOENIX_ENABLED=true
-#   PHOENIX_COLLECTOR_ENDPOINT=http://phoenix.k8s-agent.svc.cluster.local:6006/v1/traces
-#
-# Access the UI via port-forward (no ingress needed for a demo):
-#   kubectl port-forward -n k8s-agent svc/phoenix 6006:6006
-#   open http://localhost:6006
-
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: phoenix-data
-  namespace: k8s-agent
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
-  # Uses the default EKS storage class (gp2/gp3 via EBS CSI driver).
-  # Set storageClassName explicitly if your cluster uses a different class.
+# Access the UI (public NLB — provisioned automatically):
+#   kubectl get svc phoenix -n k8s-agent   # shows the external hostname
 
 ---
 apiVersion: apps/v1
@@ -60,6 +44,8 @@ spec:
         env:
         - name: PHOENIX_WORKING_DIR
           value: /mnt/data
+        - name: PHOENIX_PORT
+          value: "6006"
         volumeMounts:
         - name: data
           mountPath: /mnt/data
@@ -78,8 +64,7 @@ spec:
           periodSeconds: 10
       volumes:
       - name: data
-        persistentVolumeClaim:
-          claimName: phoenix-data
+        emptyDir: {}
       priorityClassName: infrastructure
 
 ---
