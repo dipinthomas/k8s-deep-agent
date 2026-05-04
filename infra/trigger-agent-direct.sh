@@ -82,8 +82,11 @@ if [[ "$SCENARIO" == "ok" || "$SCENARIO" == "OK" ]]; then
 
 elif [[ "$SCENARIO" == "cpu" || "$SCENARIO" == "CPU" ]]; then
   PAYLOAD_STATE="ALARM"
-  ALARM_NAME="Application Latency"
-  REASON="Application service p99 latency rising: 145ms -> 620ms."
+  ALARM_NAME="checkoutservice-p99-latency-high"
+  # Service-level alarm: node is not a single host, so use the sentinel
+  # that routes the agent into the subagent path (not node-targeted mode).
+  CHECKOUT_NODE="(service-level alarm)"
+  REASON="checkoutservice P99 latency threshold breached: 245ms -> 890ms (threshold 300ms). 2 evaluation periods."
 
 elif [[ "$SCENARIO" == "pods" || "$SCENARIO" == "PODS" ]]; then
   PAYLOAD_STATE="ALARM"

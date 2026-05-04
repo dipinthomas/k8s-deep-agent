@@ -10,6 +10,23 @@ description: Load this skill when operating against the retail-prod-eks-use1
 
 ---
 
+## OUT-OF-SCOPE WORKLOADS — NEVER TARGET THESE
+
+The following namespaces and workloads are cluster infrastructure. They are
+**NEVER** valid remediation targets regardless of CPU, memory, or latency readings:
+
+| Namespace | Workload | Reason |
+|---|---|---|
+| `k8s-agent` | `k8s-agent`, `k8s-mcp-gateway`, `agent-redis`, `phoenix` | Agent infrastructure — scaling or deleting these kills the investigation |
+| `kube-system` | any | Kubernetes control plane |
+| `amazon-cloudwatch` | any | Observability pipeline |
+
+If your `kubectl top` or pod list shows a pod from one of these namespaces as a top
+CPU consumer, **ignore it** and look for the actual noisy workload in `shop-prod`.
+Do NOT propose scaling or deleting anything outside `shop-prod`.
+
+---
+
 ## ALARM RESPONSE: checkoutservice-p99-latency-high
 
 **When this alarm fires, follow this decision tree exactly:**

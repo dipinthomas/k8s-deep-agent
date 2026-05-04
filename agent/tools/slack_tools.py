@@ -30,9 +30,9 @@ _client = None
 # investigations are scoped to that process.
 _LAST_APPROVAL_FINGERPRINT: dict[str, str] = {}
 
-# Per-thread flag: True once post_to_slack has successfully posted findings
-# to that thread. Used by post_approval_request to auto-post a summary when
-# the model skips post_to_slack and jumps straight to the approval card.
+# Per-thread flag: set to the coroutine key once post_to_slack is CALLED
+# (not after it completes). Set early so post_approval_request running
+# concurrently in the same AIMessage turn sees the flag correctly.
 _THREAD_HAS_FINDINGS: dict[str, bool] = {}
 
 
@@ -81,20 +81,20 @@ def post_to_slack(message: str, config: RunnableConfig) -> str:
         message: Message text (supports Slack mrkdwn formatting).
     """
     channel, thread_ts = _route(config)
+    thread_key = f"{channel}:{thread_ts}"
+    # Set the flag BEFORE the Slack API call so concurrent post_approval_request
+    # calls in the same AIMessage turn see it immediately. If the post fails we
+    # clear the flag below, preserving correct state.
+    _THREAD_HAS_FINDINGS[thread_key] = True
     ts, err = _post("post_to_slack", channel, thread_ts, text=message, mrkdwn=True)
-    if not err:
-        thread_key = f"{channel}:{thread_ts}"
-        _THREAD_HAS_FINDINGS[thread_key] = True
+    if err:
+        _THREAD_HAS_FINDINGS[thread_key] = False
     return f"Slack error: {err}" if err else f"Posted to Slack thread (ts={ts})"
 
 
-# This tool posts the APPROVE/DENY buttons to Slack. Call it TOGETHER with
-# post_to_slack (findings) in one turn — no destructive tool in this turn.
-# The middleware will then direct you to call the destructive tool ALONE in
-# the very next turn, where interrupt_on will pause the graph for human review.
-# Two-turn sequence:
-#   Turn N:   post_to_slack + post_approval_request  (visible in Slack, no interrupt)
-#   Turn N+1: kubectl_scale alone                    (HITL fires, graph pauses)
+# Two-turn sequence (enforced by middleware):
+#   Turn N:   post_to_slack (findings) + post_approval_request — no destructive tool
+#   Turn N+1: kubectl_scale ALONE — interrupt_on pauses the graph here
 @tool
 def post_approval_request(
     summary: str,
@@ -197,9 +197,8 @@ def post_approval_request(
         return f"Slack error posting approval request: {err}"
     _LAST_APPROVAL_FINGERPRINT[thread_key] = fingerprint
     return (
-        f"Approval UI posted to thread (ts={ts}). This tool does NOT pause "
-        "the graph. You MUST now, in this same turn, call the destructive "
-        "kubectl tool from your action_list — interrupt_on will pause the "
-        "graph at that call until the human clicks APPROVE or DENY. Do not "
-        "end the turn here."
+        f"✅ Approval card posted (ts={ts}). "
+        "In your NEXT turn call the destructive kubectl tool from action_list "
+        "ALONE — no other tool calls in that turn. interrupt_on will pause "
+        "the graph there until the human clicks APPROVE or DENY."
     )
