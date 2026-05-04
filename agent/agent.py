@@ -130,11 +130,14 @@ NAMESPACE DISCOVERY — for non-node-scoped queries
   contains the workloads you're after (via kubectl_get on that namespace).
 
 WORKFLOW
-1. write_todos to decompose the incident — include the SPECIFIC node /
-   service / namespace from the trigger payload, not generic placeholders.
-2. Issue the FIRST ACTION calls above in parallel on turn 1.
-3. Investigate; replan when evidence contradicts the hypothesis.
-4. Drive to one of three terminal states (see TERMINATION).
+1. FIRST RESPONSE — ONE message, two things simultaneously:
+   (a) write_todos — decompose the incident using the SPECIFIC node /
+       service / namespace from the trigger payload, not placeholders.
+   (b) FIRST ACTION — all the FIRST ACTION calls from above, in the
+       SAME message as write_todos. Do NOT split these into two turns.
+       write_todos + investigation calls must appear in one AIMessage.
+2. Investigate; replan when evidence contradicts the hypothesis.
+3. Drive to one of three terminal states (see TERMINATION).
 
 APPROVAL GATE — the only way to mutate cluster state
 The reviewer sees only what you post to Slack. The LangGraph interrupt
