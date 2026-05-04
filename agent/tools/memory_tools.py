@@ -6,6 +6,7 @@ from memory.store import NS_INCIDENTS, format_incident_record
 
 @tool
 async def save_incident_to_memory(
+    alarm_name: str,
     node: str,
     root_cause: str,
     evicted_pods: list[str],
@@ -23,10 +24,11 @@ async def save_incident_to_memory(
     resolution.
 
     Args:
-        node: Node name where the pressure was observed.
+        alarm_name: The CloudWatch alarm name that fired (e.g. "checkoutservice-p99-latency-high").
+        node: Node name where the pressure was observed (or "(service-level alarm)").
         root_cause: One-line root cause summary.
-        evicted_pods: List of pod names evicted during remediation.
-        pressure_dimension: e.g. disk_pct, cpu_pct, memory_pct.
+        evicted_pods: List of pod names evicted/scaled during remediation.
+        pressure_dimension: e.g. disk_pct, cpu_pct, memory_pct, latency_ms.
         before_value: Metric value before remediation.
         after_value: Metric value after remediation.
         critical_service: Name of critical service monitored, if any.
@@ -40,6 +42,7 @@ async def save_incident_to_memory(
 
     timestamp = datetime.datetime.utcnow().isoformat()
     record = format_incident_record(
+        alarm_name=alarm_name,
         node=node,
         root_cause=root_cause,
         evicted_pods=evicted_pods,
@@ -52,6 +55,6 @@ async def save_incident_to_memory(
         critical_after=critical_after,
         timestamp=timestamp,
     )
-    key = f"{node}_{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
+    key = f"{alarm_name}_{datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%S')}"
     await store.aput(NS_INCIDENTS, key, record)
     return f"Incident saved to long-term memory — key: {key}"

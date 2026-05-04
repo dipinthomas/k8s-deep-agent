@@ -19,7 +19,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from subagents import build_subagents
 from tools.slack_tools import post_to_slack, post_approval_request
 from tools.memory_tools import save_incident_to_memory
-from memory.store import build_memory_store_async, seed_memory_store
+from memory.store import build_memory_store_async
 from mcp_servers.mcp_client import get_mcp_tools_async
 from middleware import KeepLoopingMiddleware
 from optimization import (
@@ -402,7 +402,6 @@ async def build_agent_async():
     """
     checkpointer = await _build_checkpointer()
     store = await build_memory_store_async()
-    seed_memory_store(store)
 
     # Load MCP tools inside the persistent loop — sessions remain valid.
     raw_tools = await get_mcp_tools_async()
@@ -456,4 +455,4 @@ async def build_agent_async():
         system_prompt=SYSTEM_PROMPT,
     )
 
-    return agent
+    return agent, store

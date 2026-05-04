@@ -4,27 +4,23 @@ Persists incident history and known failure patterns across runs.
 Uses Redis when REDIS_URL is set; falls back to InMemoryStore for local dev.
 """
 
-import os
 import logging
+import os
+
 from langgraph.store.memory import InMemoryStore
 
 logger = logging.getLogger(__name__)
 
-# Namespace keys used for storing agent memories
-NS_INCIDENTS = ("incidents",)     # Past incidents and resolutions
-NS_PATTERNS = ("patterns",)       # Known failure patterns (root causes)
-NS_NODES = ("nodes",)             # Node-specific notes
+NS_INCIDENTS = ("incidents",)
 
 REDIS_URL = os.environ.get("REDIS_URL", "")
-
 
 
 async def build_memory_store_async():
     """
     Build a Redis-backed long-term memory store when REDIS_URL is set.
     Falls back to InMemoryStore if Redis is unavailable or langgraph's
-    redis store extra is not installed — in that case incident history is
-    lost on pod restart, but the agent still runs.
+    redis store extra is not installed.
 
     MUST be awaited from within the persistent agent event loop so the
     store's HTTP/Redis connections are bound to that loop.
@@ -41,9 +37,6 @@ async def build_memory_store_async():
         )
         return InMemoryStore()
     try:
-        # Direct construction (not via from_conn_string contextmanager) so the
-        # store outlives a single `async with` block — the agent process holds
-        # it for its entire lifetime.
         store = AsyncRedisStore(redis_url=REDIS_URL)
         await store.__aenter__()  # type: ignore[attr-defined]
         await store.setup()
@@ -58,23 +51,73 @@ async def build_memory_store_async():
         return InMemoryStore()
 
 
-def seed_memory_store(store) -> None:
+async def retrieve_past_incidents(store, alarm_name: str, limit: int = 3) -> str | None:
     """
-    Pre-seed the memory store with cluster-specific known patterns.
+    Search the incident store for past investigations matching this alarm.
+    Returns a formatted string ready to inject into the agent's initial message,
+    or None if no relevant history exists.
 
-    The agent itself is application-agnostic — known failure patterns for a
-    given deployment belong in that deployment's cluster skill
-    (skills/clusters/<cluster-name>/SKILL.md), not hardcoded here. This
-    function is intentionally a no-op so the same agent binary can run
-    against any cluster without carrying baked-in assumptions.
-
-    If you need to pre-load patterns at startup for a specific deployment,
-    extend this function in your fork or set them via the cluster skill.
+    Called before each new investigation so the agent starts with prior context.
     """
-    return None
+    if store is None:
+        return None
+    try:
+        items = await store.alist(NS_INCIDENTS)
+        if not items:
+            return None
+
+        # Filter to incidents that match this alarm_name, then take the most recent.
+        matching = [
+            i for i in items
+            if isinstance(i.value, dict) and i.value.get("alarm_name") == alarm_name
+        ]
+        # Fall back to all incidents if none match by alarm_name (e.g. records
+        # written before alarm_name was stored — backwards compatible).
+        pool = matching if matching else list(items)
+
+        recent = sorted(
+            pool,
+            key=lambda i: i.value.get("timestamp", "") if isinstance(i.value, dict) else "",
+            reverse=True,
+        )[:limit]
+
+        lines = [
+            f"LONG-TERM MEMORY — {len(recent)} past incident(s) for alarm "
+            f"`{alarm_name}` retrieved from the store:\n"
+        ]
+        for item in recent:
+            v = item.value
+            ts = v.get("timestamp", "unknown time")
+            rc = v.get("root_cause", "unknown")
+            pods = ", ".join(v.get("evicted_pods", [])) or "none"
+            metrics = v.get("metrics", {})
+            dim = metrics.get("dimension", "")
+            before = metrics.get("before", "")
+            after = metrics.get("after", "")
+            cs = v.get("critical_service", {})
+            cs_line = ""
+            if cs and cs.get("name"):
+                cs_line = (
+                    f" | {cs['name']} {cs.get('metric','')}: "
+                    f"{cs.get('before','')} → {cs.get('after','')}"
+                )
+            lines.append(
+                f"• [{ts}] Root cause: {rc} | "
+                f"Remediation: {pods} | "
+                f"{dim}: {before} → {after}{cs_line}"
+            )
+        lines.append(
+            "\nUse this history to inform your hypothesis — do not skip "
+            "investigation steps, but let prior patterns guide where you look first."
+        )
+        return "\n".join(lines)
+    except Exception:
+        logger.exception("retrieve_past_incidents failed — continuing without memory context")
+        return None
 
 
 def format_incident_record(
+    alarm_name: str,
     node: str,
     root_cause: str,
     evicted_pods: list[str],
@@ -87,30 +130,9 @@ def format_incident_record(
     critical_after: float | None = None,
     timestamp: str = "",
 ) -> dict:
-    """
-    Build a structured incident record for writing to the memory store.
-    Call this after a successful resolution.
-
-    Args:
-        node: Node name where pressure was observed.
-        root_cause: One-line root cause summary.
-        evicted_pods: List of pod names that were evicted as part of the
-            remediation.
-        pressure_dimension: Which dimension was under pressure — e.g.
-            "disk_pct", "cpu_pct", "memory_pct".
-        before_value: Value of the pressure dimension before remediation.
-        after_value: Value of the pressure dimension after remediation.
-        critical_service: Name of the critical service whose health was
-            tracked through the incident, if any.
-        critical_metric: Metric name used to track that service (e.g.
-            "p99_latency_ms").
-        critical_before: Value of the critical-service metric before
-            remediation.
-        critical_after: Value of the critical-service metric after
-            remediation.
-        timestamp: ISO-8601 timestamp of resolution.
-    """
+    """Build a structured incident record for writing to the memory store."""
     record: dict = {
+        "alarm_name": alarm_name,
         "node": node,
         "root_cause": root_cause,
         "evicted_pods": evicted_pods,
