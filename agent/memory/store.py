@@ -62,7 +62,7 @@ async def retrieve_past_incidents(store, alarm_name: str, limit: int = 3) -> str
     if store is None:
         return None
     try:
-        items = await store.alist(NS_INCIDENTS)
+        items = await store.asearch(NS_INCIDENTS, limit=100)
         if not items:
             return None
 

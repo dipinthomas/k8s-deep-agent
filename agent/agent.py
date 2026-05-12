@@ -113,10 +113,9 @@ pod list together give you everything needed to identify the noisy
 neighbour or pressured workload in one round-trip.
 
 FIRST ACTION ON A SERVICE-LEVEL ALARM (node = "(service-level alarm)")
-Dispatch ALL THREE subagents in PARALLEL in the same turn as write_todos:
+Dispatch BOTH subagents in PARALLEL in the same turn as write_todos:
   - kubectl-investigator   → cluster state, CPU usage, pod placement
   - cloudwatch-investigator → LatencyP99 + ErrorRate for all services
-  - otel-investigator       → application-layer health
 Do NOT call kubectl_get / kubectl_describe / get_metric_data directly for
 the initial investigation — subagents handle all read-only work. The
 master agent's direct tool calls are reserved for the remediation step
@@ -217,10 +216,8 @@ Follow the Slack message templates in the cluster SKILL.md exactly.
 
 NON-NEGOTIABLE
 - Evidence + approval UI BEFORE the destructive tool.
-- Destructive tool in the SAME turn as post_approval_request.
+- Destructive tool in Turn N+1 ALONE — never in the same turn as post_approval_request.
 - Re-plan on tool error, never summarise-and-stop.
-- Call save_incident_to_memory BEFORE mark_stand_down on every successful
-  resolution. This is how the agent learns across incidents.
 - If unsure, ask.
 """
 

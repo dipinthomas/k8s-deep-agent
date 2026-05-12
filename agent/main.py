@@ -36,11 +36,6 @@ import redis as redis_lib
 
 load_dotenv()
 
-# Phoenix tracing — must run before any LangChain/LangGraph execution.
-# Enabled by PHOENIX_ENABLED=true; no-op when the env var is absent.
-from observability import setup_phoenix
-setup_phoenix()
-
 # Structured DEBUG logging: each line is prefixed with a monotonic sequence number
 # so log lines can be sorted/grepped by order even when timestamps collide.
 # Use LOG_LEVEL=INFO to suppress debug output in production.

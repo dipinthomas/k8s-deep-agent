@@ -1,15 +1,7 @@
 """
 Subagent definitions for parallel incident investigation.
 
-Each subagent owns a domain (CloudWatch metrics, K8s cluster state, OTel traces).
-
-Tool list: each subagent receives the FULL MCP tool list (same as the master
-agent). An earlier optimisation filtered tools per role by keyword match,
-which saved ~30k schema tokens per subagent invocation but risked silently
-dropping tools (e.g. anything whose name didn't contain a hard-coded
-keyword). Reverted because the cost is paid back by Anthropic prompt caching
-once the prefix stabilises, and one less moving part makes behaviour easier
-to reason about.
+Each subagent owns a domain (CloudWatch metrics or K8s cluster state).
 
 Each subagent is capped by ModelCallLimitMiddleware so a tool-error loop
 inside a subagent can't burn unbounded tokens. The cap (default 15 model
@@ -63,10 +55,8 @@ def _subagent_middleware(label: str) -> list[Any]:
 
 def build_subagents(mcp_tools: list[Any]) -> list[dict]:
     """
-    Build the three subagent definitions, injecting the MCP tools loaded
-    at startup. Each subagent receives the full MCP tool list — see module
-    docstring for why per-role filtering was reverted. Called once from
-    agent.py during agent construction.
+    Build the two subagent definitions (CloudWatch + kubectl), injecting the
+    MCP tools loaded at startup. Called once from agent.py during construction.
     """
 
     cloudwatch_subagent = {
@@ -144,38 +134,4 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
         ],
     }
 
-    otel_subagent = {
-        "name": "otel-investigator",
-        "description": (
-            "Investigates application performance using OTel traces and metrics "
-            "from CloudWatch. Use for service latency, error rates, and trace analysis."
-        ),
-        "system_prompt": (
-            "You are an application observability specialist. Your job is to assess the "
-            "health and performance of services from the application layer — traces, "
-            "metrics, and logs that describe what users are experiencing, not what the "
-            "infrastructure is doing.\n\n"
-            "How to work:\n"
-            "- Start by listing available tools. Query what you can, not what you assume exists.\n"
-            "- Focus on user-facing symptoms first: latency percentiles, error rates, "
-            "  throughput changes. Then look for the cause at the application layer.\n"
-            "- Report both what is degraded AND what is healthy — healthy baselines help "
-            "  the master agent understand blast radius.\n"
-            "- If a metric or trace query returns no data, say so explicitly. Do not infer.\n\n"
-            "Output contract — always return:\n"
-            "- Latency (p50, p99) and error rate for each critical service you can observe\n"
-            "- Whether the observability pipeline itself (OTel collector) is healthy — "
-            "  report its status even if normal, because a silently-failed collector means "
-            "  all other metrics may be stale\n"
-            "- The time window you queried and any gaps in data\n"
-            "- A one-line user impact summary the master agent can quote in Slack\n\n"
-            + _RETURN_CONTRACT
-        ),
-        "tools": mcp_tools,
-        "middleware": _subagent_middleware("subagent.otel"),
-        "skills": [
-            "./skills/universal/critical-service-protection/",
-        ],
-    }
-
-    return [cloudwatch_subagent, kubectl_subagent, otel_subagent]
+    return [cloudwatch_subagent, kubectl_subagent]
