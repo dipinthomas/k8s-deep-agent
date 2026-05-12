@@ -305,6 +305,7 @@ Resources:
       Environment:
         Variables:
           AGENT_URL: !Ref AgentUrl
+          DELAY_SECONDS: "5"
       DeadLetterConfig:
         TargetArn: !GetAtt AlarmToAgentDLQ.Arn
       Code:

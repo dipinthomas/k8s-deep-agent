@@ -21,15 +21,15 @@ spec:
         karpenter.sh/do-not-disrupt: "true"
     spec:
       priorityClassName: low-priority
-      # Force this pod onto the same node as the synthesizer so the CPU
-      # saturation affects paymentservice's CPU-burn loops.
       affinity:
-        podAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-          - labelSelector:
-              matchLabels:
-                app: latency-synthesizer
-            topologyKey: kubernetes.io/hostname
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: latency-synthesizer
+              topologyKey: kubernetes.io/hostname
       terminationGracePeriodSeconds: 5
       containers:
       - name: stress

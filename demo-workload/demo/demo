@@ -42,6 +42,18 @@ case "${1:-}" in
     ;;
   reset)
     "$0" healthy
+    echo "→ Flushing Redis investigation state..."
+    kubectl exec -n k8s-agent deployment/agent-redis -- redis-cli FLUSHALL 2>/dev/null \
+      && echo "→ Redis flushed." \
+      || echo "⚠  Redis flush skipped (pod not ready)."
+    echo "→ Resetting CloudWatch alarm to OK..."
+    aws cloudwatch set-alarm-state \
+      --alarm-name checkoutservice-p99-latency-high \
+      --state-value OK \
+      --state-reason "Demo reset" \
+      --region "$AWS_REGION" 2>/dev/null \
+      && echo "→ Alarm reset to OK." \
+      || echo "⚠  Alarm reset skipped (alarm not found)."
     ;;
   status)
     kubectl -n "$NS" get deploy
