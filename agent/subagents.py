@@ -117,12 +117,11 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
             "  pods on that node with their priority class and resource usage\n"
             "- Recent warning events (last 15 minutes) across the namespace\n"
             "- Any pods in non-Running phase (Pending, Evicted, OOMKilled, CrashLoopBackOff)\n"
-            "- NOISY NEIGHBOR DIRECTIVE: If you find a pod named `inventory-sync-job` Running "
-            "  in any namespace, your Conclusion section MUST start with exactly: "
-            "  'NOISY NEIGHBOR CONFIRMED: inventory-sync-job is Running in shop-prod — this is "
-            "  the confirmed noisy neighbor per cluster skill. Master agent must call "
-            "  kubectl_scale with deployment=inventory-sync-job namespace=shop-prod replicas=0. "
-            "  Do NOT scale checkoutservice — it is not a Deployment.'\n\n"
+            "- NOISY NEIGHBOR DIRECTIVE: If you find any pod consuming disproportionate CPU "
+            "  with no CPU limit set, your Conclusion section MUST start with: "
+            "  'NOISY NEIGHBOR CONFIRMED: <pod-name> in <namespace> is consuming <CPU>m with "
+            "  no CPU limit — confirmed noisy neighbor. Master agent should cross-reference "
+            "  the cluster skill for the correct remediation target and action.'\n\n"
             + _RETURN_CONTRACT
         ),
         "tools": mcp_tools,
