@@ -53,6 +53,26 @@ _SERVER_CONFIG: dict[str, Any] = {
 }
 
 
+# Tools to exclude — these tools are loaded by the MCP servers but have no
+# functional backend in this cluster. Filtering prevents the agent from wasting
+# turns attempting queries that will always fail.
+#
+# promql_* / execute_promql_* — added by awslabs.cloudwatch-mcp-server in
+# recent versions; require a Prometheus endpoint which is not installed here.
+_BLOCKED_TOOL_SUBSTRINGS = {"promql"}
+
+
+def _filter_tools(tools: list[Any]) -> list[Any]:
+    filtered = [
+        t for t in tools
+        if not any(blocked in t.name.lower() for blocked in _BLOCKED_TOOL_SUBSTRINGS)
+    ]
+    blocked_names = [t.name for t in tools if t not in filtered]
+    if blocked_names:
+        logger.info("Filtered %d unsupported tools: %s", len(blocked_names), blocked_names)
+    return filtered
+
+
 async def get_mcp_tools_async() -> list[Any]:
     """
     Load MCP tools asynchronously. MUST be awaited from within the persistent
@@ -67,7 +87,7 @@ async def get_mcp_tools_async() -> list[Any]:
     for attempt in range(1, _MCP_LOAD_ATTEMPTS + 1):
         try:
             logger.info("Loading MCP tools (attempt %d/%d)...", attempt, _MCP_LOAD_ATTEMPTS)
-            tools = await client.get_tools()
+            tools = _filter_tools(await client.get_tools())
             logger.info(
                 "MCP ready — %d tools loaded: %s",
                 len(tools),

@@ -123,15 +123,21 @@ a Deployment-managed pod restarts immediately.
 
 ## Fault-Injection Pods (demo only)
 
-During demos, fault-injection pods may appear in the `default` namespace:
+During demos, fault-injection pods may appear in the `default` namespace.
+These are **bare pods** — they are NOT managed by a Deployment or ReplicaSet.
+`kubectl_scale` does NOT apply to bare pods. The ONLY correct remediation is `kubectl_delete pod`.
 
-| Pod name      | Purpose                              | Safe to evict? |
-|---------------|--------------------------------------|----------------|
-| `demo-stress` | CPU stress (noisy-neighbour scenario) | Yes — always  |
-| `demo-disk-filler` | Fill node disk (disk-pressure scenario) | Yes — always |
+| Pod name           | Purpose                                  | Namespace | Type      | Remediation command                                    |
+|--------------------|------------------------------------------|-----------|-----------|--------------------------------------------------------|
+| `demo-stress`      | CPU stress (noisy-neighbour scenario)    | `default` | Bare pod  | `kubectl_delete pod demo-stress -n default`            |
+| `demo-disk-filler` | Fill node disk (disk-pressure scenario)  | `default` | Bare pod  | `kubectl_delete pod demo-disk-filler -n default`       |
 
-If either pod is Running and the corresponding alarm has fired, it is the root cause.
-Apply the relevant universal skill (`noisy-neighbor` or `node-disk-pressure`).
+**Decision tree for fault-injection pods:**
+1. Run `kubectl_get pods -n default` to check if `demo-stress` or `demo-disk-filler` is Running.
+2. If Running AND the corresponding alarm has fired → this pod IS the root cause. No further investigation needed.
+3. Propose `kubectl_delete pod <name> -n default` through the two-turn approval gate.
+4. Do NOT use `kubectl_scale` — these are bare pods with no controlling Deployment.
+5. After deletion the pod will not restart (no controller), confirming successful remediation.
 
 ---
 
