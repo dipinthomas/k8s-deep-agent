@@ -82,11 +82,14 @@ if [[ "$SCENARIO" == "ok" || "$SCENARIO" == "OK" ]]; then
 
 elif [[ "$SCENARIO" == "cpu" || "$SCENARIO" == "CPU" ]]; then
   PAYLOAD_STATE="ALARM"
-  ALARM_NAME="checkoutservice-p99-latency-high"
-  # Service-level alarm: node is not a single host, so use the sentinel
-  # that routes the agent into the subagent path (not node-targeted mode).
-  CHECKOUT_NODE="(service-level alarm)"
-  REASON="checkoutservice P99 latency threshold breached: 245ms -> 890ms (threshold 300ms). 2 evaluation periods."
+  # Node-level CPU alarm so the agent enters the node-targeted path:
+  # kubectl_describe node <node> + kubectl_top + pod list on that node.
+  # This directly surfaces the demo-stress pod without needing the otel-demo
+  # workload deployed. A service-level latency alarm would route to the
+  # subagent path where the agent looks for checkout service victims that
+  # don't exist, and correctly concludes "no action needed".
+  ALARM_NAME="EKS-NodeCPUHigh-${CHECKOUT_NODE}"
+  REASON="Node CPU utilisation at 88% (threshold: 75%). One pod on this node is consuming disproportionate CPU with no limit set. Noisy-neighbour pattern detected — co-located workloads may be throttled."
 
 elif [[ "$SCENARIO" == "pods" || "$SCENARIO" == "PODS" ]]; then
   PAYLOAD_STATE="ALARM"
