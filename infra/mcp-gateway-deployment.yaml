@@ -1,0 +1,211 @@
+# MCP Gateway — runs kubectl-mcp and cloudwatch-mcp as separate containers,
+# exposed via ClusterIP so the agent pod can reach them over HTTP/SSE.
+# Apply with: kubectl apply -f infra/mcp-gateway-deployment.yaml
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k8s-mcp-gateway
+  namespace: k8s-agent
+  annotations:
+    # IRSA: same IAM role as the agent — grants CloudWatch read access.
+    eks.amazonaws.com/role-arn: arn:aws:iam::637039075925:role/k8s-agent-irsa
+
+---
+# Namespace-scoped permissions: read-only pod/log/event access in otel-demo.
+# No delete or patch verbs here — MCP gateway is read-only by default.
+# The agent itself holds the broader RBAC for destructive actions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k8s-mcp-gateway-role
+  namespace: k8s-agent
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k8s-mcp-gateway-binding
+  namespace: k8s-agent
+subjects:
+- kind: ServiceAccount
+  name: k8s-mcp-gateway
+  namespace: k8s-agent
+roleRef:
+  kind: Role
+  name: k8s-mcp-gateway-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Cluster-scoped: read nodes (needed for disk pressure checks)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-mcp-gateway-node-reader
+subjects:
+- kind: ServiceAccount
+  name: k8s-mcp-gateway
+  namespace: k8s-agent
+roleRef:
+  kind: ClusterRole
+  name: k8s-agent-node-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: k8s-mcp-gateway
+  namespace: k8s-agent
+  labels:
+    app: k8s-mcp-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: k8s-mcp-gateway
+  template:
+    metadata:
+      labels:
+        app: k8s-mcp-gateway
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      serviceAccountName: k8s-mcp-gateway
+      containers:
+      # supergateway wraps mcp-server-kubernetes (stdio-only) as streamable-http on port 3001.
+      # streamableHttp transport supports multiple concurrent connections (sse does not).
+      - name: kubectl-mcp
+        image: dipinthomas2003/k8s-mcp-gateway:latest
+        command: ["supergateway"]
+        args:
+        - "--stdio"
+        - "mcp-server-kubernetes"
+        - "--port"
+        - "3001"
+        - "--outputTransport"
+        - "streamableHttp"
+        - "--stateful"
+        - "--healthEndpoint"
+        - "/healthz"
+        ports:
+        - containerPort: 3001
+          name: kubectl-mcp
+        # IRSA vars injected by EKS automatically
+        # In-cluster config is auto-detected — KUBECONFIG not needed
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3001
+          initialDelaySeconds: 15
+          periodSeconds: 30
+          failureThreshold: 5
+
+      # supergateway wraps awslabs cloudwatch-mcp-server (stdio-only) as streamable-http on port 3002
+      - name: cloudwatch-mcp
+        image: dipinthomas2003/k8s-mcp-gateway:latest
+        command: ["supergateway"]
+        args:
+        - "--stdio"
+        - "uvx awslabs.cloudwatch-mcp-server@latest"
+        - "--port"
+        - "3002"
+        - "--outputTransport"
+        - "streamableHttp"
+        - "--stateful"
+        - "--healthEndpoint"
+        - "/healthz"
+        ports:
+        - containerPort: 3002
+          name: cloudwatch-mcp
+        env:
+        - name: AWS_REGION
+          value: "us-east-1"
+        # IRSA: EKS injects AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 3002
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 5
+
+      priorityClassName: infrastructure
+
+---
+# Cluster-scoped read across all namespaces — replaces the per-namespace binding
+# into otel-demo so the gateway works even before the demo workload is deployed.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k8s-mcp-gateway-cluster-reader
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/log", "events", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k8s-mcp-gateway-cluster-reader-binding
+subjects:
+- kind: ServiceAccount
+  name: k8s-mcp-gateway
+  namespace: k8s-agent
+roleRef:
+  kind: ClusterRole
+  name: k8s-mcp-gateway-cluster-reader
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: k8s-mcp-gateway
+  namespace: k8s-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: k8s-mcp-gateway
+  ports:
+  - name: kubectl-mcp
+    port: 3001
+    targetPort: 3001
+  - name: cloudwatch-mcp
+    port: 3002
+    targetPort: 3002

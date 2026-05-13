@@ -1,0 +1,41 @@
+{
+  "_comment": "Agent investigation update — posted as thread replies to the alert message",
+  "_variants": {
+    "acknowledgement": {
+      "text": "Starting investigation. Spawning subagents.",
+      "blocks": [
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": ":mag: *Starting investigation.* Spawning 3 subagents in parallel:\n• `cloudwatch-investigator` — disk metrics\n• `kubectl-investigator` — node/pod state\n• `otel-investigator` — checkout latency + OTel traces"
+          }
+        }
+      ]
+    },
+    "wrong_hypothesis": {
+      "text": "Initial finding: OTel collector emptyDir buffer at 87% capacity.",
+      "blocks": [
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": ":bulb: *Initial finding:* OTel collector `emptyDir` buffer at 87% capacity.\n\nHypothesis: OTel collector may be the disk culprit under high trace throughput.\nInvestigating further..."
+          }
+        }
+      ]
+    },
+    "hypothesis_revision": {
+      "text": "Hypothesis revised. Re-running analysis.",
+      "blocks": [
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": ":arrows_counterclockwise: *Hypothesis revised.*\n\nOTel collector buffer usage (87%) is within normal range for current trace volume — it is not the cause.\n\nNew signal: `imageprovider` nginx access logs showing *340MB written in last 8 minutes* — 12x normal rate.\n\nRe-running analysis focused on `imageprovider`..."
+          }
+        }
+      ]
+    }
+  }
+}

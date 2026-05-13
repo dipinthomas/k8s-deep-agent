@@ -1,0 +1,31 @@
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: payment-critical
+value: 1000000
+globalDefault: false
+description: "Payment processing services — never evict"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: infrastructure
+value: 900000
+globalDefault: false
+description: "Cluster infrastructure services (otel-collector, imageprovider)"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: user-facing
+value: 500000
+globalDefault: false
+description: "User-facing services — evict only under sustained pressure"
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: background
+value: 100000
+globalDefault: true
+description: "Background services — safe to evict under disk or resource pressure"

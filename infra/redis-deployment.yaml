@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-redis
+  namespace: k8s-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-redis
+  template:
+    metadata:
+      labels:
+        app: agent-redis
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+    spec:
+      containers:
+      - name: redis
+        # redis-stack-server bundles RediSearch (FT.* commands), required by
+        # langgraph-checkpoint-redis (AsyncRedisSaver) for index creation.
+        # Without it the checkpointer falls back to in-memory and pod restarts
+        # lose all in-flight investigation state.
+        image: redis/redis-stack-server:7.2.0-v11
+        ports:
+        - containerPort: 6379
+        env:
+        - name: REDIS_ARGS
+          value: "--appendonly yes --appendfsync everysec"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "300m"
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-redis
+  namespace: k8s-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
