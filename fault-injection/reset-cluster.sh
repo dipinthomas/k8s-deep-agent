@@ -9,8 +9,30 @@
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-default}"
+AGENT_NAMESPACE="${AGENT_NAMESPACE:-k8s-agent}"
 
 echo "🟢 Resetting cluster to healthy state..."
+echo ""
+
+# ── Flush agent investigation state (checkpoints only, NOT the memory index) ──
+# FLUSHALL destroys the Redis search index used by the long-term memory store.
+# Instead, delete only the checkpoint and write_keys keys that belong to in-flight
+# investigations, then restart the agent so the store re-initialises if needed.
+echo "==> Flushing agent investigation state (Redis checkpoints)..."
+kubectl exec -n "$AGENT_NAMESPACE" deployment/agent-redis -- \
+  redis-cli --scan --pattern 'checkpoint*' | \
+  xargs -r kubectl exec -n "$AGENT_NAMESPACE" deployment/agent-redis -- redis-cli DEL \
+  2>/dev/null && echo "    ✓ Checkpoint keys flushed" || echo "    ⚠  No checkpoint keys found (already clean)"
+
+kubectl exec -n "$AGENT_NAMESPACE" deployment/agent-redis -- \
+  redis-cli --scan --pattern 'write_keys_zset*' | \
+  xargs -r kubectl exec -n "$AGENT_NAMESPACE" deployment/agent-redis -- redis-cli DEL \
+  2>/dev/null && echo "    ✓ Write-key sets flushed" || true
+
+echo "==> Restarting agent to reinitialise memory store..."
+kubectl rollout restart deployment/k8s-agent -n "$AGENT_NAMESPACE" 2>/dev/null || true
+kubectl rollout status deployment/k8s-agent -n "$AGENT_NAMESPACE" --timeout=60s 2>/dev/null || true
+echo "    ✓ Agent restarted"
 echo ""
 
 # ── Remove fault injection pods ────────────────────────────────────────────────
