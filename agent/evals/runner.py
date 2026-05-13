@@ -134,83 +134,100 @@ def run_post_investigation_evals(
 ) -> None:
     """Entry point called from main.py after each investigation completes.
 
-    Runs the full rule-based suite synchronously (fast), then schedules the
-    LLM-as-judge suite in the background so the investigation flow isn't blocked.
+    Reads agent state safely on _agent_loop (via run_async_fn), skips if the
+    investigation is still at HITL, then runs slow evals (Phoenix queries, LLM
+    judges) in a daemon thread with its own asyncio loop so _agent_loop stays
+    free for approval resumes.
 
     Args:
         thread_ts:    Slack thread timestamp (used as LangGraph thread_id).
         channel:      Slack channel ID.
         alarm:        The original alarm dict from the /trigger payload.
         agent:        The compiled LangGraph agent (for aget_state).
-        run_async_fn: The run_async() helper from main.py (submits coroutines to the persistent loop).
+        run_async_fn: main.py's run_async() — submits coroutines to _agent_loop.
     """
+    import threading
+
     alarm_name = alarm.get("alarm_name", "")
     alarm_node = alarm.get("node", "")
 
-    async def _fetch_and_eval():
-        # 1. Read the final LangGraph state for this investigation
-        from main import agent_config
-        config = agent_config(thread_ts, channel)
-        try:
-            state = await agent.aget_state(config)
-        except Exception:
-            logger.exception("Evals: could not read agent state for thread_ts=%s", thread_ts)
-            return
+    # Read the final LangGraph state on _agent_loop (safe — uses the correct loop
+    # for the shared async Redis client). Must NOT be called from any other loop.
+    from main import agent_config
+    config = agent_config(thread_ts, channel)
 
-        values = getattr(state, "values", None) or {}
-        messages = values.get("messages", []) if isinstance(values, dict) else []
-        explicit_stand_down = values.get("explicit_stand_down", False) if isinstance(values, dict) else False
-
-        # Determine if the investigation ended at a HITL interrupt
-        tasks = getattr(state, "tasks", None) or ()
-        interrupts = []
-        for t in tasks:
-            interrupts.extend(getattr(t, "interrupts", ()) or ())
-        was_interrupted = bool(interrupts)
-
-        if not messages:
-            logger.warning("Evals: no messages in state for thread_ts=%s — skipping", thread_ts)
-            return
-
-        # 2. Rule-based evals (fast, no LLM)
-        metric_results = run_metric_evals(messages, alarm_node=alarm_node, was_interrupted=was_interrupted)
-        _log_results("RULE-BASED", metric_results)
-
-        # 3. Resolve Phoenix span for annotation
-        span_id = _get_root_span_id(thread_ts, _PHOENIX_PROJECT)
-
-        # 4. Post rule-based results to Phoenix
-        for result in metric_results:
-            _post_eval_to_phoenix(result, span_id, _PHOENIX_PROJECT)
-
-        # 5. LLM-as-judge evals (async, more expensive)
-        skill_content = _load_skill_content()
-        judge_results = await judge_module.run_all(
-            messages,
-            alarm_name=alarm_name,
-            alarm_node=alarm_node,
-            skill_content=skill_content,
-        )
-        _log_results("LLM-JUDGE", judge_results)
-
-        for result in judge_results:
-            _post_eval_to_phoenix(result, span_id, _PHOENIX_PROJECT)
-
-        # 6. Summary log line
-        all_results = metric_results + judge_results
-        passed = sum(1 for r in all_results if r.label == "pass")
-        warned = sum(1 for r in all_results if r.label == "warn")
-        failed = sum(1 for r in all_results if r.label == "fail")
-        logger.info(
-            "EVALS[%s] %d pass / %d warn / %d fail  (thread_ts=%s%s)",
-            alarm_name, passed, warned, failed, thread_ts,
-            f"  ← Phoenix span {span_id}" if span_id else "",
-        )
+    async def _get_state():
+        return await agent.aget_state(config)
 
     try:
-        run_async_fn(_fetch_and_eval())
+        state = run_async_fn(_get_state()).result(timeout=30)
     except Exception:
-        logger.exception("Evals: failed to schedule eval coroutine for thread_ts=%s", thread_ts)
+        logger.exception("Evals: could not read agent state for thread_ts=%s", thread_ts)
+        return
+
+    values = getattr(state, "values", None) or {}
+    messages = values.get("messages", []) if isinstance(values, dict) else []
+
+    tasks = getattr(state, "tasks", None) or ()
+    interrupts = []
+    for t in tasks:
+        interrupts.extend(getattr(t, "interrupts", ()) or ())
+    was_interrupted = bool(interrupts)
+
+    if was_interrupted:
+        # Investigation paused at HITL — incomplete, no evals to run yet.
+        logger.info("Evals: investigation paused at HITL for thread_ts=%s — deferring", thread_ts)
+        return
+
+    if not messages:
+        logger.warning("Evals: no messages in state for thread_ts=%s — skipping", thread_ts)
+        return
+
+    # Run slow evals (Phoenix queries + LLM judges) in a dedicated thread so
+    # _agent_loop stays free. The thread has its own asyncio loop and does NOT
+    # touch the shared async Redis client.
+    def _run_slow_evals():
+        async def _slow():
+            # Rule-based evals (fast, no LLM)
+            metric_results = run_metric_evals(messages, alarm_node=alarm_node, was_interrupted=was_interrupted)
+            _log_results("RULE-BASED", metric_results)
+
+            span_id = _get_root_span_id(thread_ts, _PHOENIX_PROJECT)
+
+            for result in metric_results:
+                _post_eval_to_phoenix(result, span_id, _PHOENIX_PROJECT)
+
+            skill_content = _load_skill_content()
+            judge_results = await judge_module.run_all(
+                messages,
+                alarm_name=alarm_name,
+                alarm_node=alarm_node,
+                skill_content=skill_content,
+            )
+            _log_results("LLM-JUDGE", judge_results)
+
+            for result in judge_results:
+                _post_eval_to_phoenix(result, span_id, _PHOENIX_PROJECT)
+
+            all_results = metric_results + judge_results
+            passed = sum(1 for r in all_results if r.label == "pass")
+            warned = sum(1 for r in all_results if r.label == "warn")
+            failed = sum(1 for r in all_results if r.label == "fail")
+            logger.info(
+                "EVALS[%s] %d pass / %d warn / %d fail  (thread_ts=%s%s)",
+                alarm_name, passed, warned, failed, thread_ts,
+                f"  ← Phoenix span {span_id}" if span_id else "",
+            )
+
+        try:
+            asyncio.run(_slow())
+        except Exception:
+            logger.exception("Evals: slow eval thread failed for thread_ts=%s", thread_ts)
+
+    try:
+        threading.Thread(target=_run_slow_evals, daemon=True, name=f"evals-{thread_ts}").start()
+    except Exception:
+        logger.exception("Evals: failed to start eval thread for thread_ts=%s", thread_ts)
 
 
 def _log_results(label: str, results: list[EvalResult]) -> None:

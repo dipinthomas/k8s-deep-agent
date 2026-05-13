@@ -27,12 +27,28 @@ import time
 import logging
 import threading
 from concurrent.futures import Future
+from typing import Any
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from langgraph.types import Command
 import redis as redis_lib
+
+# Interrupt-count cache: keyed by thread_ts, set the moment _drive() sees an
+# __interrupt__ chunk. _pending_interrupt_action_count reads from here first so
+# it never needs to call _get_state() on _agent_loop while LangGraph's generator
+# cleanup (checkpoint writes, task teardown) is still running on the same loop.
+_interrupt_count_cache: dict[str, int] = {}
+_interrupt_count_lock = threading.Lock()
+
+# Deferred stream cleanup: when _drive() breaks on __interrupt__, we store the
+# stream here instead of scheduling aclose() immediately. LangGraph's aclose()
+# monopolises _agent_loop for 30+ seconds (non-yielding cleanup); deferring it
+# until AFTER the resume ensures _agent_loop stays free for the resume stream.
+# Cleaned up in handle_approve / handle_deny after stream_agent() returns.
+_interrupt_streams: dict[str, Any] = {}
+_interrupt_streams_lock = threading.Lock()
 
 load_dotenv()
 
@@ -295,11 +311,30 @@ def stream_agent(payload, thread_ts: str, channel: str) -> None:
 
     async def _run():
         async def _drive():
-            async for chunk in agent.astream(input_payload, config):
-                logger.debug("Agent chunk: %s", chunk)
-                _scan_chunk_for_slack_posts(chunk, posted_to_slack)
-                if isinstance(chunk, dict) and "__interrupt__" in chunk:
-                    paused_hb.set()
+            _stream = agent.astream(input_payload, config)
+            _interrupted = False
+            try:
+                async for chunk in _stream:
+                    logger.debug("Agent chunk: %s", chunk)
+                    _scan_chunk_for_slack_posts(chunk, posted_to_slack)
+                    if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                        paused_hb.set()
+                        _cache_interrupt_count_from_chunk(chunk, thread_ts)
+                        with _interrupt_streams_lock:
+                            _interrupt_streams[thread_ts] = _stream
+                        _interrupted = True
+                        break  # Exit immediately — stream kept alive in _interrupt_streams
+            finally:
+                # Only close the stream here if we did NOT interrupt.
+                # On interrupt, cleanup is deferred to handle_approve/handle_deny
+                # so _agent_loop stays free for the resume's stream_agent() call.
+                # LangGraph's aclose() is non-yielding (30+ s of checkpoint writes);
+                # firing it here would block _agent_loop before the resume runs.
+                if not _interrupted:
+                    try:
+                        await _stream.aclose()
+                    except Exception:
+                        pass
         await asyncio.wait_for(_drive(), timeout=_STREAM_TIMEOUT_SEC)
 
     started = time.time()
@@ -331,6 +366,30 @@ def stream_agent(payload, thread_ts: str, channel: str) -> None:
 
 
 _SLACK_TOOL_NAMES = {"post_to_slack", "post_approval_request"}
+
+
+def _cache_interrupt_count_from_chunk(chunk: dict, thread_ts: str) -> None:
+    """Extract action_requests count from an __interrupt__ chunk and cache it.
+
+    Called from _drive() on _agent_loop the instant the chunk arrives, before
+    any generator cleanup can block the loop. This lets _pending_interrupt_action_count
+    return without touching _agent_loop at all.
+    """
+    try:
+        interrupts = chunk.get("__interrupt__", ())
+        total = 0
+        for intr in interrupts:
+            value = getattr(intr, "value", None)
+            if isinstance(value, dict):
+                total += len(value.get("action_requests") or [])
+        with _interrupt_count_lock:
+            _interrupt_count_cache[thread_ts] = total
+        logger.info(
+            "Interrupt count=%d cached for thread_ts=%s",
+            total, thread_ts,
+        )
+    except Exception:
+        logger.exception("Failed to cache interrupt count for thread_ts=%s", thread_ts)
 
 
 def _scan_chunk_for_slack_posts(chunk, flag: dict) -> None:
@@ -509,13 +568,28 @@ def _pending_interrupt_action_count(thread_ts: str, channel: str) -> int:
     interrupt is pending — the resume in that case will likely no-op cleanly,
     which is also fine.
     """
+    # Fast path: use the count cached when _drive() saw the __interrupt__ chunk.
+    # This avoids touching _agent_loop entirely — LangGraph's generator cleanup
+    # (checkpoint writes, task teardown) may still be running on that loop for
+    # up to 30s after the interrupt is yielded.
+    with _interrupt_count_lock:
+        cached = _interrupt_count_cache.get(thread_ts)
+    if cached is not None:
+        logger.info(
+            "Pending interrupt count=%d for thread_ts=%s (from cache)",
+            cached, thread_ts,
+        )
+        return cached
+
+    # Slow path: state wasn't cached (e.g. agent restarted mid-investigation).
+    # Query _agent_loop directly — may block if cleanup is still running.
     config = agent_config(thread_ts, channel)
 
     async def _get_state():
         return await agent.aget_state(config)
 
     try:
-        state = run_async(_get_state()).result()
+        state = run_async(_get_state()).result(timeout=30)
     except Exception:
         logger.exception("Failed to read graph state for thread_ts=%s", thread_ts)
         return 0
@@ -707,15 +781,6 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
         _investigations_delete(thread_ts)
         investigation_failed = True
 
-    # Run evals after the investigation completes (pass or fail).
-    # Rule-based evals are synchronous and fast; LLM judges are scheduled async.
-    # Failures here are non-fatal — evals must never affect the investigation path.
-    if not investigation_failed:
-        try:
-            from evals.runner import run_post_investigation_evals
-            run_post_investigation_evals(thread_ts, channel, alarm, agent, run_async)
-        except Exception:
-            logger.exception("Post-investigation evals failed for thread_ts=%s — ignoring", thread_ts)
 
 
 @http_app.route("/trigger", methods=["POST"])
@@ -837,6 +902,12 @@ def _register_slack_handlers() -> None:
             except Exception:
                 logger.exception("Approve resume failed")
             finally:
+                with _interrupt_count_lock:
+                    _interrupt_count_cache.pop(thread_ts, None)
+                with _interrupt_streams_lock:
+                    _old_stream = _interrupt_streams.pop(thread_ts, None)
+                if _old_stream is not None:
+                    run_async(_old_stream.aclose())
                 _investigations_delete(thread_ts)
 
         threading.Thread(target=_resume, daemon=True).start()
@@ -864,6 +935,12 @@ def _register_slack_handlers() -> None:
             except Exception:
                 logger.exception("Deny resume failed")
             finally:
+                with _interrupt_count_lock:
+                    _interrupt_count_cache.pop(thread_ts, None)
+                with _interrupt_streams_lock:
+                    _old_stream = _interrupt_streams.pop(thread_ts, None)
+                if _old_stream is not None:
+                    run_async(_old_stream.aclose())
                 _investigations_delete(thread_ts)
 
         threading.Thread(target=_resume, daemon=True).start()
