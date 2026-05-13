@@ -69,13 +69,23 @@ Post to Slack with:
   metrics recover within ~60s)
 - APPROVE / DENY buttons via `post_approval_request`
 
-### Step 7 — Remediation: scale the culprit Deployment to 0 (preferred)
-For Deployment-managed culprits (any pod whose ownerReference is a Deployment),
-use `kubectl_scale deployment/<name> -n <namespace> --replicas=0` — NOT pod
-delete. Deleting a Deployment's pod just restarts it on the same node immediately.
+### Step 7 — Choose remediation based on the culprit's resource type
 
-If the culprit is a bare pod with no controller, use
-`kubectl_delete pod <name> -n <namespace>` instead.
+First, determine what controls the culprit pod:
+```
+kubectl get pod <name> -n <namespace> -o jsonpath='{.metadata.ownerReferences[0].kind}'
+```
+
+| Owner kind        | Remediation command                                                   |
+|-------------------|-----------------------------------------------------------------------|
+| ReplicaSet        | `kubectl_scale deployment/<name> -n <ns> --replicas=0`               |
+| (none — bare pod) | `kubectl_delete pod <name> -n <ns>` — will NOT restart automatically |
+| StatefulSet       | `kubectl_scale statefulset/<name> -n <ns> --replicas=0`              |
+| DaemonSet         | `kubectl_delete pod <name> -n <ns>` — cannot scale DaemonSets to 0  |
+| Job / CronJob     | `kubectl_delete pod <name> -n <ns>` — deleting is sufficient         |
+
+**Never** `kubectl_delete` a Deployment-managed pod — the controller restarts it immediately on the same node, undoing the remediation.
+**Never** `kubectl_scale` a bare pod or DaemonSet — the command will fail or have no effect.
 
 Check the cluster skill: it may name the culprit explicitly, confirm the safe
 action, and specify whether CPU metric data is required or pod presence alone

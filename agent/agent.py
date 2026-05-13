@@ -168,10 +168,20 @@ AFTER THE GATE
 - DENY → post acknowledgment, then mark_stand_down. Do not propose a
   new action without new evidence.
 
-REMEDIATION PREFERENCE
-For pod-level pressure relief, prefer `kubectl_scale deployment/<name> -n <ns> --replicas=0`
-over `kubectl_delete pod` or node-wide drain. Deleting a Deployment-managed pod just
-restarts it immediately — scale the Deployment to 0 instead.
+REMEDIATION PREFERENCE — choose the tool based on resource type
+Before issuing any remediation, determine the pod's controller type:
+  kubectl_get pod <name> -n <ns> -o jsonpath='{.metadata.ownerReferences[0].kind}'
+
+| Owner kind        | Correct remediation                                                   |
+|-------------------|-----------------------------------------------------------------------|
+| ReplicaSet        | `kubectl_scale deployment/<name> -n <ns> --replicas=0`               |
+| (none — bare pod) | `kubectl_delete pod <name> -n <ns>` — bare pod, will NOT restart     |
+| StatefulSet       | `kubectl_scale statefulset/<name> -n <ns> --replicas=0`              |
+| DaemonSet         | `kubectl_delete pod <name> -n <ns>` — DaemonSets cannot be scaled    |
+| Job / CronJob     | `kubectl_delete pod <name> -n <ns>` — deleting is sufficient         |
+
+Never use `kubectl_delete pod` on a Deployment-managed pod — it restarts immediately.
+Never use `kubectl_scale` on a bare pod or DaemonSet — it will fail or have no effect.
 
 SYNTHESIS RULE — apply before every remediation decision:
 The cluster SKILL.md decision tree names the EXACT deployment to target. The alarm's
