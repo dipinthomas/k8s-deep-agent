@@ -4,17 +4,33 @@
 **Conference:** NZ Tech Rally 2026 · May 15, Wellington  
 **Speaker:** Dipin Thomas
 
+> **Model compatibility note:** This agent has been tested with `openai:gpt-5.4-mini`.
+> The `langchain-anthropic` package is listed in `requirements.txt` but Anthropic models
+> have not been validated end-to-end. Use `AGENT_MODEL=openai:gpt-5.4-mini` for a
+> known-working configuration.
+
+---
+
+## What This Is
+
+An autonomous AI agent that monitors an EKS cluster, investigates incidents using
+CloudWatch and the Kubernetes API in parallel via subagents, and asks for human
+approval in Slack before taking any action that mutates cluster state.
+
+The agent is **application-agnostic** — it is configured per deployment via:
+- A **cluster skill** (`skills/clusters/<cluster-name>/SKILL.md`) describing the
+  workloads, tiers, priority classes, and known characteristics of that cluster
+- **Universal skills** (`skills/universal/`) describing investigation patterns that
+  apply to any cluster (disk pressure, noisy neighbour, pod priority eviction,
+  critical-service protection)
+
 ---
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph INJECT["🔴 Fault Injection"]
-        FI["trigger-disk-pressure.sh\n• load-generator → 500 users\n• image-provider nginx → debug logging\n• fallocate 60 GB fill in pod"]
-    end
-
-    subgraph EKS["☸️ EKS Cluster — otel-demo-prod (us-east-1)"]
+    subgraph EKS["☸️ EKS Cluster"]
         direction TB
         subgraph CRITICAL["payment-critical (priority 1,000,000)"]
             CO["checkoutservice"]
@@ -23,82 +39,123 @@ flowchart TD
         end
         subgraph EVICTABLE["background (priority 100,000)"]
             LG["load-generator"]
-            IP["image-provider 🔥\nnginx debug logs\n60 GB disk fill"]
+            IP["image-provider"]
             AD["adservice"]
         end
-        NODE["EKS Node\ndisk usage > 75%"]
-        IP --> NODE
-        LG --> NODE
+        NODE["EKS Node"]
     end
 
     subgraph OBS["📊 Observability"]
-        CI["CloudWatch\nContainer Insights\nnode_filesystem_utilization"]
-        ALARM["CloudWatch Alarm\nEKS-NodeDiskPressure-otel-demo-prod\n> 75% for 2 min"]
-        SNS["SNS Topic\neks-disk-pressure-alerts"]
-        LAMBDA["Lambda\neks-alarm-to-slack"]
+        CI["CloudWatch Container Insights"]
+        ALARM["CloudWatch Alarm"]
+        SNS["SNS Topic"]
+        LAMBDA["Lambda → Slack"]
     end
 
     subgraph SLACK["💬 Slack — #k8s-alerts"]
-        ALERT["⚠️ ALERT message\nDisk pressure detected"]
-        UPDATE1["🔍 Investigating...\nSubagents spawned"]
-        WRONG["❌ Wrong hypothesis\nOTel collector buffer at 87%"]
-        RIGHT["✅ Root cause found\nimageprovider nginx logs\n340 MB/8 min"]
-        APPROVAL["⚠️ Approval request\nEvict: loadgen → imageprovider → ad\nProtected: checkout ✓ payment ✓ cart ✓\n[APPROVE] [DENY]"]
-        RESOLVED["✅ Resolved\nDisk 91% → 67%\nCheckout p99 890ms → 118ms"]
+        ALERT["⚠️ ALERT"]
+        UPDATE["🔍 Investigating..."]
+        APPROVAL["⚠️ Approval request\n[APPROVE] [DENY]"]
+        RESOLVED["✅ Resolved"]
     end
 
     subgraph AGENT["🤖 AI Agent (deepagents + LangGraph)"]
-        MASTER["Master Agent\nOpenAI gpt-5-mini\nreads AGENTS.md + skills/"]
+        MASTER["Master Agent\nreads AGENTS.md + skills/"]
         subgraph SUBAGENTS["Parallel Subagents"]
-            SA1["cloudwatch-investigator\ndisk metrics + logs"]
-            SA2["kubectl-investigator\nnode conditions + pod status"]
-            SA3["otel-investigator\ncheckout latency traces"]
+            SA1["cloudwatch-investigator"]
+            SA2["kubectl-investigator"]
         end
         INTERRUPT["LangGraph interrupt()\nstateful pause — waits for\nSlack approval"]
-        EVICT["kubectl evict\nloadgenerator ✓\nimageprovider ✓\nadservice ✓"]
+        REMEDIATE["kubectl remediation"]
     end
 
-    FI -->|fills disk| IP
-    NODE -->|scraped every 60s| CI
-    CI --> ALARM
-    ALARM -->|SNS notification| SNS
-    SNS -->|triggers| LAMBDA
-    LAMBDA -->|POST chat.postMessage| ALERT
-
+    NODE --> CI --> ALARM --> SNS --> LAMBDA --> ALERT
     ALERT -->|wakes agent| MASTER
-    MASTER --> UPDATE1
-    MASTER --> SA1 & SA2 & SA3
-    SA1 & SA2 & SA3 -->|findings| MASTER
-    MASTER --> WRONG
-    MASTER --> RIGHT
-    MASTER --> APPROVAL
-    APPROVAL --> INTERRUPT
-    INTERRUPT -->|human clicks Approve| EVICT
-    EVICT --> RESOLVED
+    MASTER --> SA1 & SA2
+    SA1 & SA2 -->|findings| MASTER
+    MASTER --> UPDATE --> APPROVAL --> INTERRUPT
+    INTERRUPT -->|human clicks Approve| REMEDIATE --> RESOLVED
 ```
 
 ---
 
-## What This Is
+## Incident Lifecycle
 
-A fully working AI agent demo that monitors an EKS cluster, autonomously investigates
-a disk pressure incident, and asks for human approval via Slack before evicting pods.
+1. CloudWatch alarm fires → message lands in the configured Slack channel
+2. Agent acknowledges in the thread and decomposes the incident into a todo list
+3. Subagents investigate in parallel:
+   - **cloudwatch-investigator** — metrics, logs, alarm states
+   - **kubectl-investigator** — node conditions, pod state, events (read-only)
+4. Agent forms a hypothesis, gathers evidence, may revise as new data arrives
+5. Agent posts findings to Slack, then issues an approval request with APPROVE / DENY buttons
+6. Graph pauses at the destructive tool call (`interrupt_on`), holding state until the human responds
+7. On APPROVE: tool executes, agent verifies recovery, writes resolution to memory
+8. On DENY: agent acknowledges and stands down
 
-The agent:
-1. Receives a CloudWatch alarm via Slack
-2. Spawns parallel subagents (CloudWatch + kubectl + OTel traces)
-3. Pursues a wrong hypothesis first, then self-corrects (intentional — shows real reasoning)
-4. Posts evidence to Slack and asks for approval
-5. Executes evictions after human approval
-6. Posts a resolution summary
+---
+
+## Repository Structure
+
+```
+.
+├── AGENTS.md                          ← Agent identity (always loaded into LLM context)
+├── CLAUDE.md                          ← Codebase documentation
+├── BUILD.md                           ← Docker build and push instructions
+│
+├── agent/
+│   ├── main.py                        ← Entry point (Flask + persistent event loop)
+│   ├── agent.py                       ← Deep Agent construction
+│   ├── subagents.py                   ← Subagent definitions
+│   ├── middleware.py                  ← KeepLoopingMiddleware (loop control)
+│   ├── optimization.py                ← Token cost middleware + tool output truncation
+│   ├── requirements.txt
+│   ├── Dockerfile
+│   ├── .env.example
+│   ├── tools/
+│   │   ├── slack_tools.py             ← Slack post + approval-request tools
+│   │   └── memory_tools.py            ← Save resolved incidents to memory
+│   ├── mcp_servers/
+│   │   ├── mcp_client.py              ← Loads tools from MCP servers
+│   │   └── servers.yaml               ← MCP server URLs
+│   ├── memory/
+│   │   └── store.py                   ← Long-term memory store
+│   └── evals/                         ← Agent evaluation framework
+│       ├── judges.py
+│       ├── metrics.py
+│       └── runner.py
+│
+├── skills/
+│   ├── universal/
+│   │   ├── node-disk-pressure/        ← Generic disk-pressure playbook
+│   │   ├── noisy-neighbor/            ← Generic CPU/memory contention playbook
+│   │   ├── pod-priority-eviction/     ← Generic priority-based eviction logic
+│   │   └── critical-service-protection/ ← Rules for protecting critical services
+│   └── clusters/
+│       └── <cluster-name>/SKILL.md    ← Per-deployment cluster skill (create your own)
+│
+├── infra/
+│   ├── agent-deployment.yaml          ← Agent + RBAC manifest
+│   ├── agent-secrets.example.yaml     ← Secrets template (copy → agent-secrets.yaml)
+│   ├── mcp-gateway-deployment.yaml    ← MCP sidecar deployment
+│   ├── mcp-gateway.Dockerfile         ← MCP gateway image
+│   ├── redis-deployment.yaml          ← Redis checkpoint store
+│   ├── priority-classes.yaml          ← K8s PriorityClass definitions
+│   ├── cloudwatch-agent.yaml          ← Container Insights ConfigMap
+│   └── cloudformation/
+│       └── agent-iam.yaml             ← IRSA role for the agent ServiceAccount
+│
+└── slack/
+    ├── bot-setup.md                   ← Slack app setup guide
+    └── message-templates/             ← Example Slack Block Kit payloads
+```
 
 ---
 
 ## Prerequisites
 
 - AWS account with EKS, CloudWatch, and IAM permissions
-- `aws`, `kubectl`, `helm`, `docker`, `curl` installed
-- Slack workspace with bot + webhook
+- `aws`, `kubectl`, `docker` installed locally
+- Slack workspace with a bot configured (see [slack/bot-setup.md](slack/bot-setup.md))
 - Python 3.11+
 - OpenAI API key
 
@@ -106,190 +163,95 @@ The agent:
 
 ## Quick Start
 
-The whole AWS stack is managed by three CloudFormation templates under
-[`infra/cloudformation/`](infra/cloudformation/) and one orchestrator script.
-
 ### 1. Configure secrets
 
 ```bash
 cp infra/agent-secrets.example.yaml infra/agent-secrets.yaml
-# Edit infra/agent-secrets.yaml — fill in ANTHROPIC_API_KEY, SLACK_*, etc.
+# Fill in OPENAI_API_KEY, SLACK_BOT_TOKEN, SLACK_APP_TOKEN, etc.
+kubectl apply -f infra/agent-secrets.yaml
 ```
 
-### 2. Deploy the stack
+### 2. Apply infrastructure manifests
 
 ```bash
-AWS_PROFILE=fernhub bash infra/deploy.sh
+# IRSA role (requires an existing EKS cluster + OIDC provider)
+AWS_PROFILE=your-aws-profile aws cloudformation deploy \
+  --template-file infra/cloudformation/agent-iam.yaml \
+  --stack-name k8s-agent-iam \
+  --capabilities CAPABILITY_NAMED_IAM
+
+# Priority classes, Redis, MCP gateway, agent
+kubectl apply -f infra/priority-classes.yaml
+kubectl apply -f infra/redis-deployment.yaml
+kubectl apply -f infra/mcp-gateway-deployment.yaml
+kubectl apply -f infra/agent-deployment.yaml
 ```
 
-The script deploys, in order:
+### 3. Set environment variables
 
-1. **`k8s-agent-cluster`** — VPC, EKS Auto Mode 1.33, OIDC provider.
-   (Container Insights addon is opt-in — see below.)
-2. **`k8s-agent-iam`** — IRSA role for the agent ServiceAccount.
-3. Kubernetes manifests — priority classes, Redis, agent secrets, agent +
-   MCP gateway deployments.
-
-First-time deploy takes ~20 minutes. Re-running is idempotent and applies only
-changed resources.
-
-> The CloudWatch-alarm → SNS → Lambda → agent pipeline is currently disabled.
-> Trigger the agent manually with a POST to its NLB `/trigger` endpoint, or
-> reintroduce a CFN stack for it later.
-
-#### Toggle Container Insights
-
-The `amazon-cloudwatch-observability` addon ships pod metrics + logs to
-CloudWatch and feeds the agent's CloudWatch MCP investigations. It costs
-~$5–20/day on an idle cluster, so it's off by default.
+Key variables in `agent-secrets.yaml` (see `infra/agent-secrets.example.yaml` for the full list):
 
 ```bash
-# Turn on before a demo (re-runs the cluster stack with the addon)
-INSTALL_OBSERVABILITY=true AWS_PROFILE=fernhub bash infra/deploy.sh
-
-# Turn off again afterwards (CFN deletes the addon and its IAM role)
-INSTALL_OBSERVABILITY=false AWS_PROFILE=fernhub bash infra/deploy.sh
+AGENT_MODEL=openai:gpt-5.4-mini   # tested and validated
+OPENAI_API_KEY=sk-proj-...
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_APP_TOKEN=xapp-...
+SLACK_CHANNEL_ID=C...
+CLUSTER_SKILL_PATH=./skills/clusters/<your-cluster>/SKILL.md
 ```
 
-### 3. Deploy the OTel demo workload (only when running the demo)
+### 4. Create a cluster skill
+
+Copy and fill in the template:
 
 ```bash
-bash otel-demo/deploy.sh
-bash infra/patch-priority-classes.sh
+mkdir -p skills/clusters/<your-cluster>
+# Create skills/clusters/<your-cluster>/SKILL.md
+# See CLAUDE.md §7 for what to include
 ```
 
-### 4. Update agent image (no stack changes)
+### 5. Trigger the agent (manual test)
 
 ```bash
-bash infra/update-agent.sh v31
-```
-
-Builds + pushes the multi-arch image and rolls out the deployment without
-touching CloudFormation.
-
-### 5. Tear everything down
-
-```bash
-AWS_PROFILE=fernhub bash infra/destroy.sh
-```
-
-Deletes the three stacks in reverse order. The script first removes the
-agent's `LoadBalancer` Service so the AWS Load Balancer Controller releases
-the NLB before the cluster stack tries to delete the subnets.
-
-### Slack setup
-
-See [slack/bot-setup.md](slack/bot-setup.md) for creating the bot and webhook.
-The credentials go into `infra/agent-secrets.yaml` (template:
-`infra/agent-secrets.example.yaml`) and are mounted into the agent pod.
-
----
-
-## Running the Demo
-
-### Trigger the Failure
-
-```bash
-bash fault-injection/trigger-disk-pressure.sh
-```
-
-Disk pressure builds in ~3–5 minutes. The CloudWatch alarm fires, Slack receives
-the alert, and the agent begins its investigation automatically.
-
-### Watch the Demo Flow
-
-| Time  | What Happens |
-|-------|-------------|
-| T+0:00 | CloudWatch alarm fires → Slack alert in #k8s-alerts |
-| T+0:15 | Agent acknowledges, spawns 3 subagents in parallel |
-| T+0:45 | Agent posts wrong hypothesis (OTel collector) |
-| T+1:15 | Agent corrects itself (imageprovider nginx logs) |
-| T+1:45 | Agent posts evidence + approval request with [APPROVE] button |
-| T+2:00 | Speaker clicks APPROVE live on stage |
-| T+2:05 | Agent evicts loadgenerator → imageprovider → adservice |
-| T+2:30 | Agent posts resolution summary |
-
-### Reset After Demo
-
-```bash
-bash fault-injection/reset-cluster.sh
+curl -X POST http://<agent-service>/trigger \
+  -H "Content-Type: application/json" \
+  -d '{"alarm_name": "TestAlarm", "description": "Manual test trigger"}'
 ```
 
 ---
 
-## Repository Structure
+## Adapting to a New Cluster
 
-```
-├── AGENTS.md                    # Cluster identity — always loaded by agent
-├── README.md                    # This file
-├── infra/
-│   ├── deploy.sh                # Orchestrator: CFN deploy + kubectl apply
-│   ├── destroy.sh               # Orchestrator: CFN delete (reverse order)
-│   ├── update-agent.sh          # Push new image + roll out (no CFN change)
-│   ├── cloudformation/
-│   │   ├── cluster.yaml         # VPC + EKS Auto Mode + OIDC + CW addon
-│   │   └── agent-iam.yaml       # IRSA role for the agent ServiceAccount
-│   ├── agent-deployment.yaml    # Agent + MCP sidecars manifest
-│   ├── mcp-gateway-deployment.yaml
-│   ├── redis-deployment.yaml    # Agent checkpoint/memory store
-│   ├── cloudwatch-agent.yaml    # Container Insights ConfigMap
-│   └── priority-classes.yaml    # K8s PriorityClass definitions
-├── otel-demo/
-│   ├── values.yaml              # Helm values for OTel demo
-│   └── deploy.sh                # One-command deploy script
-├── agent/
-│   ├── main.py                  # Entry point
-│   ├── agent.py                 # Deep Agent setup
-│   ├── subagents.py             # Subagent definitions
-│   ├── requirements.txt         # Python dependencies
-│   ├── .env.example             # Environment variable template
-│   ├── tools/
-│   │   ├── cloudwatch_tools.py
-│   │   ├── kubectl_tools.py
-│   │   └── slack_tools.py
-│   ├── mcp/
-│   │   ├── mcp_config.py
-│   │   └── servers.yaml
-│   └── memory/
-│       └── store.py
-├── skills/
-│   ├── node-disk-pressure/SKILL.md
-│   ├── pod-priority-eviction/SKILL.md
-│   └── checkout-protection/SKILL.md
-├── fault-injection/
-│   ├── trigger-disk-pressure.sh
-│   ├── reset-cluster.sh
-│   └── README.md
-└── slack/
-    ├── bot-setup.md
-    └── message-templates/
-        ├── alert.json
-        ├── investigation-update.json
-        ├── approval-request.json
-        └── resolution-summary.json
-```
+1. Create `skills/clusters/<cluster-name>/SKILL.md` — describe workloads, service tiers,
+   priority classes, healthy thresholds, and known incident patterns
+2. Set `CLUSTER_SKILL_PATH` in `agent-secrets.yaml` to that file
+3. Apply the priority classes from `infra/priority-classes.yaml` to the cluster
+4. Configure CloudWatch alarms to route to the Slack channel via SNS → Lambda
+
+The universal skills do not need to change — they describe patterns applicable to any
+cluster; the cluster skill supplies the specifics.
 
 ---
 
-## Key Concepts Demonstrated
+## Key Concepts
 
-| Demo Moment | Concept | Talk Slide |
-|---|---|---|
-| Agent reads AGENTS.md | Cluster identity layer | "The Onboarding Doc" |
-| Skill triggered for disk pressure | Progressive disclosure | "The Senior Engineer's Instinct" |
-| Three subagents spawn | Parallel investigation | "The War Room" |
-| MCP servers called | Standardised tool protocol | "Tools + MCP" |
-| Wrong hypothesis + re-plan | write_todos / re-planning | "The Agent Loop" |
-| Stateful pause in Slack | LangGraph interrupt() | "The Escalation Call" |
-| Resolution written to memory | Long-term memory store | "The Engineer Who Never Forgets" |
+| Agent Behaviour | Concept |
+|---|---|
+| Reads `AGENTS.md` on every investigation | Cluster identity layer |
+| Loads cluster skill + universal skills | Progressive skill disclosure |
+| Two subagents run in parallel | Parallel investigation |
+| Calls kubectl + CloudWatch via MCP | Standardised tool protocol |
+| Re-plans when hypotheses are wrong | Agent loop with `KeepLoopingMiddleware` |
+| Pauses in Slack for human approval | LangGraph `interrupt_on` |
+| Writes resolution to memory store | Long-term memory across incidents |
 
 ---
 
 ## References
 
 - [Deep Agents docs](https://docs.langchain.com/oss/python/deepagents/overview)
-- [OTel Demo repo](https://github.com/open-telemetry/opentelemetry-demo)
-- [Previous talk (LangGraph 3-node)](https://github.com/dipinthomas/langraph_3node_agent)
 - [MCP spec](https://modelcontextprotocol.io)
-- [kagent (K8s-native agent runtime)](https://kagent.dev)
+- [LangGraph human-in-the-loop](https://langchain-ai.github.io/langgraph/concepts/human_in_the_loop/)
+- [AWS CloudWatch Container Insights for EKS](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Container-Insights-setup-EKS-quickstart.html)
+- [Previous talk (LangGraph 3-node)](https://github.com/dipinthomas/langraph_3node_agent)
 - [NZ Tech Rally](https://nztechrally.nz)

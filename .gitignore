@@ -27,6 +27,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Claude Code local config (may contain tokens/secrets)
+.claude/
+
 # Terraform
 infra/.terraform/
 infra/*.tfstate

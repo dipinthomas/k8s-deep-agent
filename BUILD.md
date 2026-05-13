@@ -113,7 +113,7 @@ AWS credentials:
 
 ```bash
 git pull                                          # pick up the v40 manifest
-AWS_PROFILE=fernhub kubectl apply -f infra/agent-deployment.yaml
+AWS_PROFILE=your-aws-profile kubectl apply -f infra/agent-deployment.yaml
 kubectl rollout status deployment/k8s-agent -n k8s-agent --timeout=300s
 kubectl logs -n k8s-agent deployment/k8s-agent -f
 ```
