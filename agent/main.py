@@ -113,7 +113,6 @@ from agent import build_agent_async
 # on missing env vars.
 slack_app: App | None = None
 agent = None
-_store = None  # long-term memory store — set during bootstrap, used by run_investigation
 CHANNEL: str = ""
 _redis: redis_lib.Redis | None = None
 
@@ -125,7 +124,7 @@ _REDIS_INVESTIGATIONS_KEY = "k8s_agent:active_investigations"
 def bootstrap() -> None:
     """Initialise the persistent loop, Slack app, agent, and Redis client.
     Called once from __main__ — never at import time."""
-    global slack_app, agent, _store, CHANNEL, _redis
+    global slack_app, agent, CHANNEL, _redis
 
     threading.Thread(target=_start_agent_loop, daemon=True, name="agent-loop").start()
 
@@ -148,7 +147,7 @@ def bootstrap() -> None:
         logger.error("Redis unavailable after 10 attempts — investigation persistence disabled")
 
     logger.info("Bootstrapping agent inside persistent event loop...")
-    agent, _store = run_async(build_agent_async()).result()
+    agent = run_async(build_agent_async()).result()
     logger.info("Agent ready.")
 
     # Register Slack handlers on the now-initialised slack_app.
@@ -737,26 +736,8 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
     reason = alarm.get("reason", "")
     node = alarm.get("node", "unknown")
 
-    # Retrieve past incidents for this alarm from long-term memory.
-    # Injected into the initial message so the agent starts with prior context.
-    from memory.store import retrieve_past_incidents
-    past_context = ""
-    if _store is not None:
-        try:
-            past_context = run_async(
-                retrieve_past_incidents(_store, alarm_name)
-            ).result() or ""
-            if past_context:
-                logger.info(
-                    "Injecting long-term memory context for alarm=%s into thread_ts=%s",
-                    alarm_name, thread_ts,
-                )
-        except Exception:
-            logger.exception(
-                "Memory retrieval failed for alarm=%s — continuing without prior context",
-                alarm_name,
-            )
-
+    # Past incident context is now retrieved on-demand by the agent itself —
+    # it reads /memories/incidents.md via read_file in its first turn.
     initial_message = (
         f"CloudWatch alarm fired:\n\n"
         f"Alarm: {alarm_name}\n"
@@ -765,10 +746,7 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
         f"Slack thread: {thread_ts}\n"
         f"Channel: {channel}\n"
     )
-    if past_context:
-        initial_message += f"\n{past_context}\n"
 
-    investigation_failed = False
     try:
         stream_agent(
             [{"role": "user", "content": initial_message}],
@@ -779,7 +757,6 @@ def run_investigation(alarm: dict, channel: str, thread_ts: str) -> None:
         # stream_agent already posted the failure to the thread.
         logger.exception("Investigation failed for thread_ts=%s", thread_ts)
         _investigations_delete(thread_ts)
-        investigation_failed = True
 
 
 
