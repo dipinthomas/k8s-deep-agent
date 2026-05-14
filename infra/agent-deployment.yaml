@@ -102,7 +102,7 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v117
+        image: dipinthomas2003/k8s-deep-agent:v118
         imagePullPolicy: Always
         envFrom:
         - secretRef:
@@ -144,7 +144,16 @@ spec:
           value: "http://localhost:3001/mcp"
         - name: CLOUDWATCH_MCP_URL
           value: "http://localhost:3002/mcp"
-        # Redis memory store — persists incident history across agent pod restarts.
+        # File-based memory: incidents.md is stored on an emptyDir volume mounted
+        # at /agent-memory. Survives container restarts (kubelet keeps emptyDir
+        # alive as long as the Pod exists). For cross-pod persistence, replace
+        # emptyDir with a PVC.
+        - name: AGENT_MEMORY_DIR
+          value: "/agent-memory"
+        volumeMounts:
+        - name: agent-memory
+          mountPath: /agent-memory
+        # Redis is still used for the LangGraph checkpointer (HITL pause/resume).
         - name: REDIS_URL
           value: "redis://agent-redis.k8s-agent.svc.cluster.local:6379"
         # IRSA: EKS automatically injects these two vars into pods whose
@@ -248,6 +257,10 @@ spec:
           initialDelaySeconds: 30
           periodSeconds: 30
           failureThreshold: 5
+
+      volumes:
+      - name: agent-memory
+        emptyDir: {}
 
       priorityClassName: infrastructure
 
