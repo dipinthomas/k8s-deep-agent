@@ -126,11 +126,9 @@ def build_subagents(mcp_tools: list[Any]) -> list[dict]:
         ),
         "tools": mcp_tools,
         "middleware": _subagent_middleware("subagent.kubectl"),
-        "skills": [
-            "./skills/universal/node-disk-pressure/",
-            "./skills/universal/noisy-neighbor/",
-            "./skills/universal/pod-priority-eviction/",
-        ],
+        # A skills source is a folder OF skill folders. Pointing at a single
+        # skill folder (".../noisy-neighbor/") finds nothing, so pass the parent.
+        "skills": ["/harness/skills/universal/"],
     }
 
     return [cloudwatch_subagent, kubectl_subagent]

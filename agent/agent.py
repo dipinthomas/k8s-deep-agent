@@ -387,6 +387,22 @@ def _wrap_with_error_handling(tool):
 
 CLUSTER_SKILL_PATH = os.environ.get("CLUSTER_SKILL_PATH", "")
 
+# Repo root that holds AGENTS.md and skills/. Defaults to the folder above
+# agent/ (= /app in the EKS image, the repo root when run locally), so it works
+# whatever the current working directory is. Override with HARNESS_ROOT.
+HARNESS_ROOT = os.path.abspath(
+    os.environ.get("HARNESS_ROOT")
+    or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+
+def _harness_path(local_path: str) -> str:
+    """Map a repo-relative path (./skills/clusters/x/SKILL.md) to /harness/..."""
+    if not os.path.isabs(local_path):
+        local_path = os.path.join(HARNESS_ROOT, local_path)
+    rel = os.path.relpath(os.path.normpath(local_path), HARNESS_ROOT)
+    return "/harness/" + rel.replace(os.sep, "/")
+
 # Per-call hard cap on LLM HTTP requests. Without this the OpenAI / Anthropic
 # SDKs default to a multi-minute timeout, so a stalled stream pins the worker
 # thread for ~10 minutes before any retry kicks in. 90s is generous for a single
@@ -471,6 +487,14 @@ async def build_agent_async():
                 root_dir=MEMORY_DIR,
                 virtual_mode=True,
             ),
+            # Harness files (AGENTS.md, skills/, cluster skill) live on disk in
+            # the image. Without this route they resolve against StateBackend,
+            # which is empty, so the agent silently starts with no skills and
+            # no AGENTS.md.
+            "/harness/": FilesystemBackend(
+                root_dir=HARNESS_ROOT,
+                virtual_mode=True,
+            ),
         },
     )
 
@@ -500,7 +524,7 @@ async def build_agent_async():
     agent = create_deep_agent(
         model=model,
         backend=backend,
-        skills=["./skills/universal/"],
+        skills=["/harness/skills/universal/"],
         subagents=build_subagents(mcp_tools),
         tools=[
             post_to_slack,
@@ -515,8 +539,8 @@ async def build_agent_async():
         checkpointer=checkpointer,
         interrupt_on=interrupt_on,
         memory=(
-            ["./AGENTS.md"]
-            + ([CLUSTER_SKILL_PATH] if CLUSTER_SKILL_PATH else [])
+            ["/harness/AGENTS.md"]
+            + ([_harness_path(CLUSTER_SKILL_PATH)] if CLUSTER_SKILL_PATH else [])
         ),
         system_prompt=SYSTEM_PROMPT,
     )
