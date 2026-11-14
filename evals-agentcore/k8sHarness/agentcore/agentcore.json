@@ -1,0 +1,115 @@
+{
+  "name": "k8sHarness",
+  "version": 2,
+  "managedBy": "CDK",
+  "runtimes": [
+    {
+      "name": "k8s_agent",
+      "modelProvider": "Bedrock",
+      "description": "k8s deep agent (nz-tech-rally) with Gateway tools, AgentCore Memory and OTel",
+      "build": "CodeZip",
+      "entrypoint": "main.py",
+      "codeLocation": "app/k8s_agent",
+      "runtimeVersion": "PYTHON_3_13",
+      "envVars": [
+        {
+          "name": "AGENT_MODEL",
+          "value": "bedrock_converse:global.anthropic.claude-sonnet-5-5"
+        },
+        {
+          "name": "CLUSTER_SKILL_PATH",
+          "value": "./clusters/retail-prod/SKILL.md"
+        },
+        {
+          "name": "HARNESS_VERSION",
+          "value": "fixed"
+        }
+      ],
+      "protocol": "HTTP",
+      "additionalPolicies": [
+        "runtime-policy.json"
+      ],
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 1800,
+        "maxLifetime": 7200
+      }
+    }
+  ],
+  "memories": [
+    {
+      "name": "incidentMemory",
+      "description": "Resolved incidents as episodes",
+      "eventExpiryDuration": 7,
+      "strategies": [
+        {
+          "type": "EPISODIC",
+          "namespaceTemplates": [
+            "/episodes/{actorId}/{sessionId}"
+          ],
+          "reflectionNamespaceTemplates": [
+            "/episodes/{actorId}"
+          ]
+        }
+      ]
+    }
+  ],
+  "knowledgeBases": [],
+  "credentials": [],
+  "evaluators": [
+    {
+      "name": "harness_rules",
+      "level": "SESSION",
+      "description": "Deterministic harness rules: approval before change, right target, scale not delete",
+      "config": {
+        "codeBased": {
+          "managed": {
+            "codeLocation": "app/harness_rules",
+            "entrypoint": "lambda_function.handler",
+            "timeoutSeconds": 60,
+            "additionalPolicies": [
+              "execution-role-policy.json"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "onlineEvalConfigs": [
+    {
+      "name": "live_incident_quality",
+      "agent": "k8s_agent",
+      "evaluators": [
+        "Builtin.GoalSuccessRate",
+        "Builtin.SkillSelectionAccuracy",
+        "Builtin.SkillInstructionFollowing",
+        "harness_rules"
+      ],
+      "samplingRate": 100,
+      "description": "Scores every incident session the agent handles",
+      "enableOnCreate": true
+    }
+  ],
+  "agentCoreGateways": [
+    {
+      "name": "k8s-tools",
+      "protocolType": "MCP",
+      "description": "Replayed kubectl and CloudWatch tools for the retail-prod lab",
+      "targets": [
+        {
+          "name": "k8s-replay",
+          "targetType": "lambdaFunctionArn",
+          "lambdaFunctionArn": {
+            "lambdaArn": "<set by scripts/setup_replay.py>",
+            "toolSchemaFile": "../replay_lambda/tool-schema.json"
+          }
+        }
+      ],
+      "authorizerType": "AWS_IAM",
+      "enableSemanticSearch": false,
+      "exceptionLevel": "NONE"
+    }
+  ],
+  "policyEngines": [],
+  "configBundles": [],
+  "harnesses": []
+}
