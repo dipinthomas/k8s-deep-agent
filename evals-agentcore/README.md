@@ -67,7 +67,7 @@ bug back with `fixes/reintroduce-skills-bug.patch`, so you can see it.
   (`global.anthropic.claude-sonnet-5-5`). Enable it in the Bedrock console under **Model access**.
 - A region with AgentCore Runtime, Gateway, Memory and Evaluations. We tested `ap-southeast-2`.
 - Node 20+, Python 3.10+, [`uv`](https://docs.astral.sh/uv/), the AWS CLI.
-- `npm i -g @aws/agentcore aws-cdk`
+- `npm i -g @aws/agentcore@1.0.2 aws-cdk` (1.0.2 matches the CDK project; on 14 Nov 2026 1.0.3 failed to install, and 0.x is too old)
 - CDK bootstrapped once per account and region: `cdk bootstrap aws://<account-id>/<region>`
 
 > [!WARNING]
