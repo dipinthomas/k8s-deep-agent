@@ -5,7 +5,7 @@
 
 Normally the EPISODIC strategy turns a finished session into a long-term record
 about 15 minutes later. This writes a long-term record directly (no waiting),
-in the namespace the agent recalls from (/episodes/<actor>/...).
+in the namespace the agent recalls from (/episodes/<actor>).
 """
 import datetime
 import os
@@ -39,7 +39,9 @@ mem = next((m for m in memories if m["id"].startswith("k8sHarness_") and "incide
 if not mem:
     raise SystemExit("incident memory not found: deploy the lab first (agentcore deploy)")
 
-ns = f"/episodes/{ACTOR_ID}/seeded-{uuid.uuid4().hex[:8]}"
+# Exactly the namespace main.py recalls from (retrieval matches the namespace
+# exactly; it is also where the EPISODIC strategy writes its reflections).
+ns = f"/episodes/{ACTOR_ID}"
 resp = data.batch_create_memory_records(memoryId=mem["id"], records=[{
     "requestIdentifier": uuid.uuid4().hex, "namespaces": [ns], "content": {"text": EPISODE},
     "timestamp": datetime.datetime.now(datetime.timezone.utc)}])

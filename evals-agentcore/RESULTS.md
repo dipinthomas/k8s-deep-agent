@@ -6,7 +6,23 @@ Model: `global.anthropic.claude-sonnet-5-5` (Bedrock Converse).
 All numbers come from the recorded sessions, the evaluation output and the console. None are estimated.
 Your numbers will differ a little from run to run, because an LLM judges most of them.
 
-## Headline
+## Second check: fresh clone in a new region (15 November 2026, `ap-south-1`)
+
+A fresh clone of the branch, run in Mumbai following the README, from `preflight.sh` to
+`teardown.sh`. One run per variant.
+
+| | as-shipped | fixed |
+|---|---|---|
+| "No skills available yet" in the prompt | yes (22 spans) | no; noisy-neighbor skill and AGENTS.md loaded |
+| Builtin.GoalSuccessRate | 0.0 | 1.0 |
+| Builtin.TrajectoryInOrderMatch | 0.0 | 1.0 |
+| harness_rules | 0.8 | 0.8 |
+| Memory demo (`seed_memory.py` then `--use-memory`) | | seeded incident recalled in the prompt |
+
+Found and fixed during this check: the first ~12 minutes of traces in a new region are dropped
+(`run_incident.py` now waits), and `seed_memory.py` must write to the exact recall namespace.
+
+## Headline (first run, Sydney)
 
 | | as-shipped (3 sessions) | fixed (3 sessions) |
 |---|---|---|

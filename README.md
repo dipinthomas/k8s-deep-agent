@@ -32,7 +32,7 @@ Troubleshooting at Scale, 24/7", Wellington, 15 May 2026).
 
 | | What you need | Time | Cost |
 |---|---|---|---|
-| **1. AgentCore lab** (start here) | An AWS account with Bedrock access | ~30 min | Bedrock tokens (~140k per incident) + small AgentCore charges |
+| **1. AgentCore lab** (start here) | An AWS account with Bedrock access | ~30 min (+12 min the first time in a region) | Bedrock tokens (~140k per incident) + small AgentCore charges |
 | **2. On your laptop** with Docker | Docker + AWS credentials (or an OpenAI key) | ~10 min | Model tokens only |
 | **3. On a real EKS cluster** with Slack | An EKS cluster, a Slack app | ~1 hour | Your cluster + model tokens |
 
@@ -120,6 +120,9 @@ Our numbers from one full run: [evals-agentcore/RESULTS.md](evals-agentcore/RESU
 - **Memory takes about 15 minutes.** AgentCore Memory writes the long-term "episode" about
   15 minutes after a session ends, so a second run straight away recalls nothing. For a demo, run
   `python scripts/seed_memory.py` first, then `run_incident.py --use-memory`.
+- **The first run in a new region waits about 12 minutes.** The first `agentcore deploy` in a region
+  turns on CloudWatch Transaction Search, which drops traces for its first ~12 minutes. Sessions run
+  in that window can't be evaluated, so `run_incident.py` waits it out once and tells you why.
 - **It's a replay.** The lab answers tool calls from a recorded incident, not a live cluster. That's
   why it's safe and repeatable.
 - **The skill evaluators show "no results"**, even when the fixed agent reads a skill. RESULTS.md

@@ -13,7 +13,7 @@ export AWS_REGION="$REGION"
 # The replay Lambda and its role. Read the role from the function so older
 # setups (role without the region suffix) are cleaned up too.
 ROLE="$(aws lambda get-function-configuration --function-name k8s-harness-replay --query Role --output text 2>/dev/null | awk -F/ '{print $NF}')"
-aws lambda delete-function --function-name k8s-harness-replay 2>/dev/null
+aws lambda delete-function --function-name k8s-harness-replay >/dev/null 2>&1
 aws logs delete-log-group --log-group-name /aws/lambda/k8s-harness-replay 2>/dev/null
 aws ssm delete-parameter --name /k8s-harness-lab/state 2>/dev/null
 for r in $(printf '%s\n' "$ROLE" "k8s-harness-replay-role-$REGION" | grep -v '^$' | sort -u); do

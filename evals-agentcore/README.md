@@ -156,6 +156,10 @@ then run `agentcore deploy` again. Only Claude Sonnet 5.5 was tested on this pat
 
 - **Memory is slow to appear.** AgentCore Memory builds the long-term episode about 15 minutes after a
   session, so a second run straight away recalls nothing. Use `seed_memory.py` for demos.
+- **The first run in a new region waits about 12 minutes.** The first deploy turns on CloudWatch
+  Transaction Search, which drops spans for its first ~12 minutes; a session run then has nothing to
+  evaluate. `run_incident.py` checks and waits once (`--no-wait` skips it). In some regions the spans
+  land in a `spans` stream of the runtime's log group instead of `aws/spans`; `evaluate.py` reads both.
 - **It's a replay, not a live cluster.** The Lambda answers from a recorded incident, so the agent
   can't break anything, and every run starts from the same state.
 - **The skill evaluators return "no results"** even for the fixed agent. See RESULTS.md.

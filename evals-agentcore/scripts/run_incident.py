@@ -13,6 +13,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 import uuid
 
 import boto3
@@ -46,6 +47,14 @@ def runtime_arn() -> str:
 
 
 def call(arn, session_id, payload):
+    try:
+        return _call(arn, session_id, payload)
+    except Exception as e:  # not retried: re-sending an alarm would start a second investigation
+        print(f"  [error] invoke failed ({type(e).__name__}: {str(e)[:200]}). Re-run this incident.")
+        return {"status": "error", "error": str(e)[:500]}
+
+
+def _call(arn, session_id, payload):
     r = ac.invoke_agent_runtime(agentRuntimeArn=arn, runtimeSessionId=session_id,
                                 payload=json.dumps(payload).encode(), contentType="application/json", accept="application/json")
     body = r["response"].read().decode()
@@ -64,14 +73,38 @@ def show(resp):
         print(f"  [approval needed] {a}")
 
 
+TRACING_WARMUP_SEC = 12 * 60
+
+
+def wait_for_tracing(skip: bool) -> None:
+    """First deploy in a region turns on CloudWatch Transaction Search (it creates the
+    aws/spans log group). Spans sent in roughly the first 12 minutes after that are
+    dropped, so a session run too early can't be evaluated. Wait it out once."""
+    groups = sess.client("logs").describe_log_groups(logGroupNamePrefix="aws/spans").get("logGroups", [])
+    if not groups:
+        print("note: CloudWatch Transaction Search isn't on yet in this region (agentcore deploy turns it on);"
+              " this session's traces may be missing")
+        return
+    age = time.time() - groups[0]["creationTime"] / 1000
+    if age >= TRACING_WARMUP_SEC or skip:
+        return
+    wait = int(TRACING_WARMUP_SEC - age)
+    print(f"First run in {REGION}: tracing was switched on {int(age // 60)} min ago and drops spans for its first"
+          f" ~12 min.\nWaiting {wait // 60} min {wait % 60} s so this session can be evaluated"
+          " (Ctrl-C to stop; --no-wait to skip).")
+    time.sleep(wait)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--tag", required=True)
     ap.add_argument("--decision", default="approve")
     ap.add_argument("--use-memory", action="store_true")
+    ap.add_argument("--no-wait", action="store_true", help="don't wait for tracing warm-up in a new region")
     a = ap.parse_args()
     arn = runtime_arn()
+    wait_for_tracing(a.no_wait)
     out = LAB / "results"
     out.mkdir(exist_ok=True)
     for i in range(a.runs):

@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: ["**"]
     tags: ["agent-v*", "mcp-v*"]   # agent-v119 -> k8s-deep-agent:v119, mcp-v3 -> k8s-mcp-gateway:v3
   workflow_dispatch:
 
