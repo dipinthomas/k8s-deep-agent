@@ -65,27 +65,34 @@ bug back with `fixes/reintroduce-skills-bug.patch`, so you can see it.
 - An AWS account where you can create IAM roles, Lambda functions and AgentCore resources.
 - **Bedrock model access** to the model you use. The default is Claude Sonnet 5.5
   (`global.anthropic.claude-sonnet-5-5`). Enable it in the Bedrock console under **Model access**.
-- A region with AgentCore Runtime, Gateway, Memory and Evaluations. We tested `ap-southeast-2`.
-- Node 20+, Python 3.10+, [`uv`](https://docs.astral.sh/uv/), the AWS CLI.
-- `npm i -g @aws/agentcore@1.0.2 aws-cdk` (1.0.2 matches the CDK project; on 14 Nov 2026 1.0.3 failed to install, and 0.x is too old)
+- A region with AgentCore Runtime, Gateway, Memory and Evaluations. We tested `ap-southeast-2`
+  (Sydney) and `ap-south-1` (Mumbai).
+- Node 20+, Python 3.10+, [`uv`](https://docs.astral.sh/uv/) (`pip install uv`), the AWS CLI.
+- `npm i -g @aws/agentcore@1.0.2 aws-cdk` (1.0.2 matches the CDK project; 0.x is too old).
 - CDK bootstrapped once per account and region: `cdk bootstrap aws://<account-id>/<region>`
+
+Run `./scripts/preflight.sh` (after the venv step below). It checks every item above, including a
+one-line Bedrock call, and prints the fix for anything missing.
 
 > [!WARNING]
 > **Cost and cleanup**
 > - Bedrock tokens: one incident uses about **140k tokens** (one trace we measured: 141,733).
->   Six runs plus evaluation is about 1M tokens.
-> - The online evaluation `live_incident_quality` scores **100% of sessions** with LLM judges. Lower
->   `samplingRate` in `k8sHarness/agentcore/agentcore.json`, or delete it, after the lab.
-> - Always run `./scripts/teardown.sh` when you're done.
+>   The commands below (one run per variant plus evaluation) use roughly 400k.
+> - The online evaluation `live_incident_quality` scores **10% of sessions** with LLM judges
+>   (`samplingRate` in `k8sHarness/agentcore/agentcore.json`). Raise it to 100 to see every run in
+>   the dashboard; it costs judge tokens per session.
+> - Always run `./scripts/teardown.sh` when you're done. It removes everything in `AWS_REGION`
+>   except the CDK bootstrap stack.
 
 ## Run it
 
 ```bash
-export AWS_PROFILE=<your-profile>          # any profile; CloudShell already has credentials
-export AWS_REGION=<your-region>            # e.g. ap-southeast-2
+export AWS_PROFILE=<your-profile>          # any profile; skip in CloudShell
+export AWS_REGION=<your-region>            # e.g. ap-south-1
 
 cd evals-agentcore
 uv venv && source .venv/bin/activate && uv pip install boto3
+./scripts/preflight.sh                     # fix anything marked ✗ first
 
 # 1. Replay Lambda + state; writes your account into aws-targets.json and agentcore.json
 python scripts/setup_replay.py
@@ -96,13 +103,13 @@ python scripts/setup_replay.py
 (cd k8sHarness && agentcore deploy)
 
 # 3. Fire the incident and score it
-python scripts/run_incident.py --runs 3 --tag as-shipped
+python scripts/run_incident.py --runs 1 --tag as-shipped
 python scripts/evaluate.py --tag as-shipped --extra-evaluator harness_rules
 
 # 4. Switch to the fixed agent, redeploy, run and score again
 ./scripts/sync_agent.sh fixed
 (cd k8sHarness && agentcore deploy)
-python scripts/run_incident.py --runs 3 --tag fixed
+python scripts/run_incident.py --runs 1 --tag fixed
 python scripts/evaluate.py --tag fixed --extra-evaluator harness_rules
 
 # 5. Remove everything
@@ -110,7 +117,17 @@ python scripts/evaluate.py --tag fixed --extra-evaluator harness_rules
 ```
 
 `run_incident.py` plays the on-call engineer. It prints what the agent would post to Slack and
-approves the action it asks for. Use `--runs 1` to save tokens.
+approves the action it asks for. Use `--runs 3` per variant for steadier numbers (3x the tokens).
+
+### Memory demo
+
+```bash
+python scripts/seed_memory.py                                   # one past incident, no waiting
+python scripts/run_incident.py --runs 1 --tag memory --use-memory
+```
+
+The agent's prompt now starts with "Past incidents from long-term memory". Without seeding, AgentCore
+Memory needs about 15 minutes after a session to build the long-term record.
 
 ## What to look for
 
@@ -138,20 +155,26 @@ then run `agentcore deploy` again. Only Claude Sonnet 5.5 was tested on this pat
 ## Things that will surprise you
 
 - **Memory is slow to appear.** AgentCore Memory builds the long-term episode about 15 minutes after a
-  session. Run `run_incident.py --use-memory` again after waiting, or the second run recalls nothing.
+  session, so a second run straight away recalls nothing. Use `seed_memory.py` for demos.
 - **It's a replay, not a live cluster.** The Lambda answers from a recorded incident, so the agent
   can't break anything, and every run starts from the same state.
 - **The skill evaluators return "no results"** even for the fixed agent. See RESULTS.md.
 - **`agentcore eval ondemand` aborts** on these big sessions (about 25 MB each). Use
   `scripts/evaluate.py`, which calls the Evaluate API directly.
+- **CloudShell's home folder is 1 GB.** The deploy needs about 600 MB, so clone into `/tmp` and run
+  the teardown before the session ends.
+- **Running in two regions is fine.** Everything is regional; the one global resource, the replay
+  Lambda's IAM role, is named `k8s-harness-replay-role-<region>`.
 
 ## Files
 
 | Path | What it is |
 |---|---|
+| `scripts/preflight.sh` | Checks tools, versions, credentials, region, CDK bootstrap, AgentCore and Bedrock access |
 | `scripts/setup_replay.py` | Creates the replay Lambda, its IAM role and SSM state; wires the Gateway target |
 | `scripts/sync_agent.sh` | Copies `../agent`, `../skills`, `../AGENTS.md` into the runtime code (`as-shipped` or `fixed`) |
 | `scripts/run_incident.py` | Fires the alarm, approves, records each session to `results/sessions.jsonl` |
+| `scripts/seed_memory.py` | Writes one past incident into AgentCore Memory for the memory demo |
 | `scripts/evaluate.py` | Scores recorded sessions with AgentCore Evaluations |
 | `scripts/teardown.sh` | Deletes everything the lab created (not the CDK bootstrap stack) |
 | `k8sHarness/` | AgentCore project (`agentcore.json`, CDK, runtime and evaluator code) |
