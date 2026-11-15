@@ -84,8 +84,8 @@
         "Builtin.SkillInstructionFollowing",
         "harness_rules"
       ],
-      "samplingRate": 100,
-      "description": "Scores every incident session the agent handles",
+      "samplingRate": 10,
+      "description": "Scores 10% of incident sessions (raise to 100 to see every lab run in the dashboard)",
       "enableOnCreate": true
     }
   ],

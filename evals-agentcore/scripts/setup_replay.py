@@ -2,7 +2,7 @@
 
   python scripts/setup_replay.py            # uses AWS_PROFILE / AWS_REGION from the env
 
-Creates: IAM role k8s-harness-replay-role, Lambda k8s-harness-replay, SSM parameter
+Creates: IAM role k8s-harness-replay-role-<region>, Lambda k8s-harness-replay, SSM parameter
 /k8s-harness-lab/state. Then sets aws-targets.json (account, region) and adds the
 Lambda as target "k8s-replay" on gateway "k8s-tools" in agentcore.json.
 """
@@ -17,8 +17,12 @@ import boto3
 
 LAB = pathlib.Path(__file__).resolve().parents[1]
 PROJECT = LAB / "k8sHarness"
-REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
-FN, ROLE, PARAM = "k8s-harness-replay", "k8s-harness-replay-role", "/k8s-harness-lab/state"
+REGION = os.environ.get("AWS_REGION") or boto3.Session().region_name
+if not REGION:
+    raise SystemExit("Set AWS_REGION (or a region in your AWS profile), e.g. export AWS_REGION=us-east-1")
+# IAM is global, so the role name carries the region: running the lab in two
+# regions (or tearing one down) never touches the other region's role.
+FN, ROLE, PARAM = "k8s-harness-replay", f"k8s-harness-replay-role-{REGION}", "/k8s-harness-lab/state"
 
 sess = boto3.Session(region_name=REGION)
 account = sess.client("sts").get_caller_identity()["Account"]
@@ -50,6 +54,8 @@ for attempt in range(6):
                                       Description="Replays the retail-prod noisy-neighbour incident as kubectl/CloudWatch tools")["FunctionArn"]
         except lam.exceptions.ResourceConflictException:
             arn = lam.update_function_code(FunctionName=FN, ZipFile=code)["FunctionArn"]
+            lam.get_waiter("function_updated_v2").wait(FunctionName=FN)
+            lam.update_function_configuration(FunctionName=FN, Role=role_arn)
         break
     except lam.exceptions.InvalidParameterValueException:
         time.sleep(10)  # new role not yet assumable

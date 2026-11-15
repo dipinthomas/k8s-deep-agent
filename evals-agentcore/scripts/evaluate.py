@@ -40,7 +40,9 @@ ASSERTIONS = [
 TRAJECTORY = ["kubectl_top", "get_metric_data", "post_to_slack", "post_approval_request", "kubectl_scale"]
 BATCH = 10
 
-REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+REGION = os.environ.get("AWS_REGION") or boto3.Session().region_name
+if not REGION:
+    raise SystemExit("Set AWS_REGION (or a region in your AWS profile), e.g. export AWS_REGION=us-east-1")
 sess = boto3.Session(region_name=REGION)
 logs = sess.client("logs", config=Config(retries={"max_attempts": 8, "mode": "adaptive"}, read_timeout=300))
 data = sess.client("bedrock-agentcore", config=Config(read_timeout=900, retries={"max_attempts": 3, "mode": "standard"}))

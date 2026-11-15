@@ -22,7 +22,9 @@ LAB = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(LAB / "replay_lambda"))
 from replay_core import ALARM  # noqa: E402
 
-REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+REGION = os.environ.get("AWS_REGION") or boto3.Session().region_name
+if not REGION:
+    raise SystemExit("Set AWS_REGION (or a region in your AWS profile), e.g. export AWS_REGION=us-east-1")
 sess = boto3.Session(region_name=REGION)
 ac = sess.client("bedrock-agentcore", config=Config(read_timeout=900, retries={"max_attempts": 0}))
 lam = sess.client("lambda")
