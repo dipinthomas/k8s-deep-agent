@@ -283,6 +283,18 @@ NON-NEGOTIABLE
 _DESTRUCTIVE_NAME_KEYWORDS = {
     "delete", "drain", "evict", "apply", "patch",
     "scale", "restart", "create", "update", "replace", "rollout",
+    # Run-anything / install tools (mcp-server-kubernetes exec_in_pod,
+    # kubectl_generic, *_helm_chart, cleanup; CloudWatch start/stop_*).
+    "exec", "generic", "install", "uninstall", "upgrade", "cleanup", "helm",
+    "start", "stop",
+}
+
+# Always gated, whatever their description says. kubectl_generic can run any
+# kubectl command (including delete) and exec_in_pod any shell command, so
+# leaving them ungated would bypass the approval gate entirely.
+_ALWAYS_GATED = {
+    "kubectl_generic", "exec_in_pod", "node_management", "port_forward", "cleanup",
+    "install_helm_chart", "upgrade_helm_chart", "uninstall_helm_chart",
 }
 
 # Keywords in a tool DESCRIPTION that signal it is destructive
@@ -316,7 +328,7 @@ def _build_interrupt_on(mcp_tools: list) -> dict:
         name_match = bool(name_tokens & _DESTRUCTIVE_NAME_KEYWORDS)
         desc_match = any(kw in desc_lower for kw in _DESTRUCTIVE_DESC_KEYWORDS)
 
-        if name_match or desc_match:
+        if name_match or desc_match or tool.name in _ALWAYS_GATED:
             # Explicit allowed_decisions list (instead of `True`) so the
             # MORE DETAILS Slack button can resume with decision="respond".
             # The shorthand `True` only enables ["approve", "edit", "reject"];
@@ -419,7 +431,7 @@ def _build_model_with_timeout(model_spec: str):
         # agent still runs. Log loudly so it's discoverable.
         logger.warning(
             "AGENT_MODEL=%r has no provider prefix — passing through without "
-            "timeout/retry config. Use 'openai:gpt-5-mini' or 'anthropic:claude-...'.",
+            "timeout/retry config. Use 'openai:gpt-5.4-mini', 'anthropic:...' or 'bedrock_converse:...'.",
             model_spec,
         )
         return model_spec
@@ -518,7 +530,7 @@ async def build_agent_async():
         )
 
     model = _build_model_with_timeout(
-        os.environ.get("AGENT_MODEL", "openai:gpt-5-mini")
+        os.environ.get("AGENT_MODEL", "openai:gpt-5.4-mini")
     )
 
     agent = create_deep_agent(
