@@ -43,7 +43,7 @@ tests/smoke/run.sh tools && tests/smoke/run.sh sidecars
 Then build and push both architectures. Any registry works (Docker Hub, ECR, GHCR):
 
 ```bash
-REPO=<your-registry>/<your-namespace>      # e.g. docker.io/alice or 123456789012.dkr.ecr.us-east-1.amazonaws.com
+REPO=<your-registry>/<your-namespace>      # e.g. docker.io/alice or <account-id>.dkr.ecr.<region>.amazonaws.com
 docker login <your-registry>                # or: aws ecr get-login-password | docker login --username AWS --password-stdin <ecr-host>
 
 docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION=v120 \
