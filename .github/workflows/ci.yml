@@ -29,6 +29,9 @@ jobs:
       - name: requirements.txt matches requirements.in
         run: |
           cd agent
+          # Compile onto a copy of the lock: uv keeps existing pins, so this only fails when
+          # requirements.in changed without re-locking (not when upstream ships a new release).
+          cp requirements.txt /tmp/req.txt
           uv pip compile requirements.in -o /tmp/req.txt --python-version 3.11 --python-platform linux -q
           diff <(grep -v '^#' requirements.txt) <(grep -v '^#' /tmp/req.txt) \
             || { echo "::error::agent/requirements.txt is stale: re-run the uv pip compile command in requirements.in"; exit 1; }
