@@ -1,0 +1,8 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "Model", "Effect": "Allow", "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], "Resource": "*"},
+    {"Sid": "GatewayTools", "Effect": "Allow", "Action": ["bedrock-agentcore:InvokeGateway"], "Resource": "*"},
+    {"Sid": "IncidentMemory", "Effect": "Allow", "Action": ["bedrock-agentcore:CreateEvent", "bedrock-agentcore:ListEvents", "bedrock-agentcore:GetEvent", "bedrock-agentcore:DeleteEvent", "bedrock-agentcore:RetrieveMemoryRecords", "bedrock-agentcore:ListMemoryRecords", "bedrock-agentcore:ListSessions"], "Resource": "*"}
+  ]
+}

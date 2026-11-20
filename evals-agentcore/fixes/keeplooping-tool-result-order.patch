@@ -1,0 +1,33 @@
+--- a/agent/middleware.py	2026-11-12 19:14:45
++++ b/agent/middleware.py	2026-11-12 19:14:52
+@@ -289,13 +289,28 @@
+                 if self._destructive_just_executed(messages):
+                     return None
+ 
++                # The AIMessage still has pending tool_use blocks. A HumanMessage
++                # appended now sits between tool_use and tool_result, which
++                # Bedrock Converse / Anthropic reject (400 "tool_use ids were
++                # found without tool_result blocks immediately after").
++                # Execute the Slack calls in-band first (same as Case 0a) so
++                # the history reads AI(tool_use) -> ToolMessage(s) -> nudge.
++                # If other tools are queued alongside, skip the nudge and let
++                # the tools node run them; the model sees the results next turn.
++                if any(self._tc_name(tc) not in self._SLACK_TOOL_NAMES for tc in tool_calls):
++                    return None
++                synthetic = self._execute_slack_tools_inline(tool_calls, runtime)
++                if len(synthetic) != len(tool_calls):
++                    return None
++
+                 logger.info(
+                     "KeepLooping: post_approval_request called without destructive "
+-                    "tool (expected two-turn pattern) — directing model to call "
+-                    "the destructive tool alone in the next turn"
++                    "tool (expected two-turn pattern) — executed Slack in-band, "
++                    "directing model to call the destructive tool alone next turn"
+                 )
+                 return {
+                     "messages": [
++                        *synthetic,
+                         HumanMessage(
+                             content=(
+                                 "✅ Approval card posted to Slack. "

@@ -1,0 +1,332 @@
+[
+ {
+  "name": "kubectl_get",
+  "description": "Get or list Kubernetes resources (pods, nodes, deployments, events, priorityclasses, namespaces, replicasets). Equivalent to `kubectl get <resourceType> [name] -n <namespace> [-o output]`.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "resourceType": {
+     "type": "string",
+     "description": "Resource type, e.g. pods, nodes, deployments, events"
+    },
+    "name": {
+     "type": "string",
+     "description": "Resource name (optional)"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace (optional)"
+    },
+    "allNamespaces": {
+     "type": "boolean",
+     "description": "List across all namespaces"
+    },
+    "output": {
+     "type": "string",
+     "description": "Output format, e.g. wide or json"
+    },
+    "labelSelector": {
+     "type": "string",
+     "description": "Label selector"
+    },
+    "fieldSelector": {
+     "type": "string",
+     "description": "Field selector, e.g. spec.nodeName=<node>"
+    }
+   },
+   "required": [
+    "resourceType"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_describe",
+  "description": "Describe a Kubernetes resource in detail (`kubectl describe <resourceType> <name>`).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "resourceType": {
+     "type": "string",
+     "description": "Resource type"
+    },
+    "name": {
+     "type": "string",
+     "description": "Resource name"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace"
+    }
+   },
+   "required": [
+    "resourceType",
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_top",
+  "description": "Show CPU and memory usage for nodes or pods (`kubectl top nodes|pods`).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "resource": {
+     "type": "string",
+     "description": "nodes or pods"
+    },
+    "name": {
+     "type": "string",
+     "description": "Name (optional)"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace (optional)"
+    },
+    "allNamespaces": {
+     "type": "boolean",
+     "description": "All namespaces"
+    },
+    "sortBy": {
+     "type": "string",
+     "description": "cpu or memory"
+    }
+   },
+   "required": [
+    "resource"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_logs",
+  "description": "Get logs from a pod (`kubectl logs <pod> -n <namespace>`).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Pod name"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace"
+    },
+    "tail": {
+     "type": "integer",
+     "description": "Lines"
+    }
+   },
+   "required": [
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_scale",
+  "description": "Scale a deployment or statefulset (`kubectl scale <resourceType>/<name> --replicas=N`). Modifies cluster state.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Deployment or statefulset name"
+    },
+    "replicas": {
+     "type": "integer",
+     "description": "Desired replicas"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace"
+    },
+    "resourceType": {
+     "type": "string",
+     "description": "deployment or statefulset"
+    }
+   },
+   "required": [
+    "name",
+    "replicas"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_delete",
+  "description": "Delete a Kubernetes resource (`kubectl delete <resourceType> <name>`). Modifies cluster state.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "resourceType": {
+     "type": "string",
+     "description": "Resource type"
+    },
+    "name": {
+     "type": "string",
+     "description": "Resource name"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace"
+    }
+   },
+   "required": [
+    "resourceType",
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_patch",
+  "description": "Patch a Kubernetes resource with a JSON or merge patch. Modifies cluster state.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "resourceType": {
+     "type": "string",
+     "description": "Resource type"
+    },
+    "name": {
+     "type": "string",
+     "description": "Resource name"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "Namespace"
+    },
+    "patchData": {
+     "type": "string",
+     "description": "Patch as JSON string"
+    }
+   },
+   "required": [
+    "resourceType",
+    "name"
+   ]
+  }
+ },
+ {
+  "name": "kubectl_context",
+  "description": "Get or list kubeconfig contexts.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "operation": {
+     "type": "string",
+     "description": "get or list"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_active_alarms",
+  "description": "List CloudWatch alarms currently in ALARM state.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "max_items": {
+     "type": "integer",
+     "description": "Max alarms"
+    }
+   },
+   "required": []
+  }
+ },
+ {
+  "name": "get_metric_data",
+  "description": "Fetch CloudWatch metric datapoints for a namespace, metric name and dimensions over a time window.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "namespace": {
+     "type": "string",
+     "description": "Metric namespace, e.g. RetailProd/Services"
+    },
+    "metric_name": {
+     "type": "string",
+     "description": "Metric name, e.g. LatencyP99, ErrorRate, CPUUtilization"
+    },
+    "dimensions": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": {
+       "Name": {
+        "type": "string"
+       },
+       "Value": {
+        "type": "string"
+       }
+      }
+     },
+     "description": "Dimensions"
+    },
+    "start_time": {
+     "type": "string",
+     "description": "ISO start"
+    },
+    "end_time": {
+     "type": "string",
+     "description": "ISO end"
+    },
+    "statistic": {
+     "type": "string",
+     "description": "Statistic"
+    },
+    "period": {
+     "type": "integer",
+     "description": "Period seconds"
+    }
+   },
+   "required": [
+    "namespace",
+    "metric_name"
+   ]
+  }
+ },
+ {
+  "name": "execute_log_insights_query",
+  "description": "Run a CloudWatch Logs Insights query over the given log groups.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "log_group_names": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "description": "Log groups"
+    },
+    "query_string": {
+     "type": "string",
+     "description": "Logs Insights query"
+    },
+    "start_time": {
+     "type": "string",
+     "description": "ISO start"
+    },
+    "end_time": {
+     "type": "string",
+     "description": "ISO end"
+    }
+   },
+   "required": [
+    "log_group_names",
+    "query_string"
+   ]
+  }
+ },
+ {
+  "name": "describe_log_groups",
+  "description": "List CloudWatch log groups.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "log_group_name_prefix": {
+     "type": "string",
+     "description": "Prefix"
+    }
+   },
+   "required": []
+  }
+ }
+]

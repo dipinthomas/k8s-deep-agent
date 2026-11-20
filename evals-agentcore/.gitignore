@@ -1,0 +1,12 @@
+results/
+dist/
+k8sHarness/agentcore/cdk/node_modules/
+k8sHarness/agentcore/cdk/cdk.out/
+k8sHarness/app/k8s_agent/agent_src/
+k8sHarness/app/k8s_agent/skills/
+k8sHarness/app/k8s_agent/clusters/
+k8sHarness/app/k8s_agent/AGENTS.md
+__pycache__/
+k8sHarness/agentcore/.cli/
+k8sHarness/agentcore/.cache/
+k8sHarness/agentcore/aws-targets.json

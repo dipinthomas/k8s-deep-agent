@@ -1,6 +1,18 @@
-# K8s AI Agent — deployment, RBAC, and service account
-# Apply with: kubectl apply -f infra/agent-deployment.yaml
-# Requires: infra/agent-secrets.yaml applied first (see agent-secrets.example.yaml)
+# K8s AI Agent — namespace, service account, RBAC, deployment
+#
+# This is a TEMPLATE. Don't kubectl apply it directly: run infra/deploy.sh, which
+# replaces the double-underscore placeholders for your account, region and cluster:
+#   ROLE_ARN (IRSA role from infra/cloudformation/agent-iam.yaml), AWS_REGION,
+#   CLUSTER_NAME, AGENT_IMAGE, MCP_IMAGE (defaults: the published, tested tags),
+#   AGENT_MODEL (provider:model, e.g. openai:gpt-5.4-mini).
+# Requires the k8s-agent-secrets Secret (infra/agent-secrets.example.yaml) and the
+# k8s-agent-cluster-skill ConfigMap (deploy.sh creates it from your SKILL.md).
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k8s-agent
 
 ---
 apiVersion: v1
@@ -10,11 +22,11 @@ metadata:
   namespace: k8s-agent
   annotations:
     # IRSA: grants the agent pod AWS credentials via the k8s-agent-irsa IAM role.
-    # Role is created by infra/setup-agent-irsa.sh — run that before deploying.
-    eks.amazonaws.com/role-arn: arn:aws:iam::637039075925:role/k8s-agent-irsa
+    # Role is created by infra/deploy.sh (infra/cloudformation/agent-iam.yaml).
+    eks.amazonaws.com/role-arn: __ROLE_ARN__
 
 ---
-# Namespace-scoped permissions: full pod/log/event access in otel-demo
+# Namespace-scoped permissions in the agent's own namespace
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -102,24 +114,23 @@ spec:
       serviceAccountName: k8s-agent
       containers:
       - name: agent
-        image: dipinthomas2003/k8s-deep-agent:v117
-        imagePullPolicy: Always
+        image: __AGENT_IMAGE__
+        imagePullPolicy: IfNotPresent
         envFrom:
         - secretRef:
             name: k8s-agent-secrets
         env:
         - name: AWS_REGION
-          value: "us-east-1"
+          value: "__AWS_REGION__"
         - name: CLUSTER_NAME
-          value: "eks-demo-cluster"
+          value: "__CLUSTER_NAME__"
         - name: AGENT_MODEL
-          value: "openai:gpt-5.4-mini"
+          value: "__AGENT_MODEL__"
         - name: LOG_LEVEL
           value: "INFO"
-        # Cluster-specific skill injected at deploy time — change this to switch clusters.
-        # Must point to a SKILL.md under skills/clusters/<name>/.
+        # Cluster skill: mounted from the k8s-agent-cluster-skill ConfigMap (see volumes).
         - name: CLUSTER_SKILL_PATH
-          value: "./skills/clusters/eks-demo-cluster/SKILL.md"
+          value: "./skills/clusters/__CLUSTER_NAME__/SKILL.md"
         # Cost / quality knobs (rollback of v35 over-aggressive defaults — Apr 2026):
         #   TOOL_OUTPUT_CHAR_LIMIT was 8000 by default in optimization.py and
         #   was truncating real kubectl output mid-list, hiding the pod the
@@ -144,7 +155,13 @@ spec:
           value: "http://localhost:3001/mcp"
         - name: CLOUDWATCH_MCP_URL
           value: "http://localhost:3002/mcp"
-        # Redis memory store — persists incident history across agent pod restarts.
+        # File-based memory: incidents.md is stored on an emptyDir volume mounted
+        # at /agent-memory. Survives container restarts (kubelet keeps emptyDir
+        # alive as long as the Pod exists). For cross-pod persistence, replace
+        # emptyDir with a PVC.
+        - name: AGENT_MEMORY_DIR
+          value: "/agent-memory"
+        # Redis is still used for the LangGraph checkpointer (HITL pause/resume).
         - name: REDIS_URL
           value: "redis://agent-redis.k8s-agent.svc.cluster.local:6379"
         # IRSA: EKS automatically injects these two vars into pods whose
@@ -152,6 +169,12 @@ spec:
         # The AWS SDK (boto3) picks them up via the default credential chain.
         # AWS_ROLE_ARN            — injected by EKS
         # AWS_WEB_IDENTITY_TOKEN_FILE — injected by EKS
+        volumeMounts:
+        - name: agent-memory
+          mountPath: /agent-memory
+        - name: cluster-skill
+          mountPath: /app/skills/clusters/__CLUSTER_NAME__
+          readOnly: true
         ports:
         - containerPort: 8080
           name: http-trigger
@@ -182,7 +205,7 @@ spec:
       # The k8s-agent ServiceAccount provides both K8s RBAC and IRSA credentials.
 
       - name: kubectl-mcp
-        image: dipinthomas2003/k8s-mcp-gateway:v2
+        image: __MCP_IMAGE__
         command: ["supergateway"]
         args:
         - "--stdio"
@@ -216,11 +239,11 @@ spec:
           failureThreshold: 5
 
       - name: cloudwatch-mcp
-        image: dipinthomas2003/k8s-mcp-gateway:v2
+        image: __MCP_IMAGE__
         command: ["supergateway"]
         args:
         - "--stdio"
-        - "uvx awslabs.cloudwatch-mcp-server@latest"
+        - "awslabs.cloudwatch-mcp-server"
         - "--port"
         - "3002"
         - "--outputTransport"
@@ -233,7 +256,7 @@ spec:
           name: cloudwatch-mcp
         env:
         - name: AWS_REGION
-          value: "us-east-1"
+          value: "__AWS_REGION__"
         resources:
           requests:
             memory: "256Mi"
@@ -249,6 +272,13 @@ spec:
           periodSeconds: 30
           failureThreshold: 5
 
+      volumes:
+      - name: agent-memory
+        emptyDir: {}
+      - name: cluster-skill
+        configMap:
+          name: k8s-agent-cluster-skill
+
       priorityClassName: infrastructure
 
 ---
@@ -257,11 +287,11 @@ kind: Service
 metadata:
   name: k8s-agent
   namespace: k8s-agent
-  annotations:
-    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
-    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+  # ClusterIP: /trigger has no authentication, so it is not exposed to the
+  # internet. Alarms reach the agent through Slack; for a manual test use
+  #   kubectl port-forward -n k8s-agent svc/k8s-agent 8080:8080
 spec:
-  type: LoadBalancer
+  type: ClusterIP
   selector:
     app: k8s-agent
   ports:
@@ -269,8 +299,8 @@ spec:
       targetPort: 8080
       name: http-trigger
 
-# Cross-namespace access into otel-demo is already granted by the cluster-wide
+# Cross-namespace access into workload namespaces is already granted by the cluster-wide
 # ClusterRoleBinding above (apiGroups/resources/verbs all *). Per-namespace
 # bindings would only add value if we tightened cluster scope; for now the
 # cluster-admin binding is sufficient and avoids a hard dependency on the
-# otel-demo namespace existing at agent deploy time.
+# workload namespace existing at agent deploy time.

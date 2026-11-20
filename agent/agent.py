@@ -13,13 +13,12 @@ import logging
 import os
 from functools import wraps
 from deepagents import create_deep_agent
+from deepagents.backends import CompositeBackend, StateBackend, FilesystemBackend
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
 
 from subagents import build_subagents
 from tools.slack_tools import post_to_slack, post_approval_request
-from tools.memory_tools import save_incident_to_memory
-from memory.store import build_memory_store_async
 from mcp_servers.mcp_client import get_mcp_tools_async
 from middleware import KeepLoopingMiddleware
 from optimization import (
@@ -79,6 +78,47 @@ async def _build_checkpointer():
 
 logger = logging.getLogger(__name__)
 
+# Directory where the agent's file-based memory lives. Mounted as an emptyDir
+# volume in K8s (survives container restarts, not pod reschedules — fine for
+# testing). Override via AGENT_MEMORY_DIR for a PVC-backed path in production.
+MEMORY_DIR = os.environ.get("AGENT_MEMORY_DIR", "/tmp/agent-memory")
+
+# Path the agent reads/writes for cross-incident memory.
+_INCIDENTS_FILE = "/memories/incidents.md"
+
+_INCIDENTS_TEMPLATE = """\
+# Incident Memory — K8s Agent
+
+This file records resolved incidents. The agent reads it at the start of each
+investigation to recall past root causes and successful remediations.
+Append a new entry after every successful resolution using edit_file.
+
+## Format (one block per incident)
+
+### YYYY-MM-DD — <alarm_name>
+- **Node:** <node>
+- **Root cause:** <one line>
+- **Action taken:** <pod/deployment evicted or scaled>
+- **Before / After:** <metric> <before_value> → <after_value>
+- **Critical service:** <name> (<metric>: <before> → <after>) or N/A
+
+---
+
+"""
+
+
+def _seed_memory_dir() -> None:
+    """Create the memory directory and seed incidents.md if it doesn't exist."""
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    incidents_path = os.path.join(MEMORY_DIR, "incidents.md")
+    if not os.path.exists(incidents_path):
+        with open(incidents_path, "w") as f:
+            f.write(_INCIDENTS_TEMPLATE)
+        logger.info("Seeded file-based memory at %s", incidents_path)
+    else:
+        logger.info("File-based memory exists at %s", incidents_path)
+
+
 SYSTEM_PROMPT = """\
 You are an autonomous Kubernetes operations agent.
 
@@ -128,13 +168,20 @@ NAMESPACE DISCOVERY — for non-node-scoped queries
 - Only use a specific namespace once you have CONFIRMED it exists and
   contains the workloads you're after (via kubectl_get on that namespace).
 
+INCIDENT MEMORY
+Read /memories/incidents.md in your very first turn (alongside write_todos
+and the first investigation calls). It records past root causes and
+remediations for this cluster. Use it to prioritise your hypothesis — do
+not skip investigation steps, but let prior patterns guide where you look first.
+If the file is empty or contains only the template, proceed normally.
+
 WORKFLOW
-1. FIRST RESPONSE — ONE message, two things simultaneously:
+1. FIRST RESPONSE — ONE message, three things simultaneously:
    (a) write_todos — decompose the incident using the SPECIFIC node /
        service / namespace from the trigger payload, not placeholders.
-   (b) FIRST ACTION — all the FIRST ACTION calls from above, in the
-       SAME message as write_todos. Do NOT split these into two turns.
-       write_todos + investigation calls must appear in one AIMessage.
+   (b) read_file /memories/incidents.md — recall past incidents.
+   (c) FIRST ACTION — all the FIRST ACTION calls from above, in the
+       SAME message. Do NOT split these into multiple turns.
 2. Investigate; replan when evidence contradicts the hypothesis.
 3. Drive to one of three terminal states (see TERMINATION).
 
@@ -159,8 +206,9 @@ approval card is visible before the graph pauses.
 
 AFTER THE GATE
 - APPROVE → the gated tool already ran and its result is in your context.
-  On success: post_to_slack with the outcome, then save_incident_to_memory,
-  then mark_stand_down.
+  On success: post_to_slack with the outcome, then append the incident to
+  /memories/incidents.md using edit_file (append a new ### block following
+  the format in the file header), then mark_stand_down.
   On error ("Tool error: ..."): RE-PLAN. Pick a different tool or retry
   with corrective flags (e.g. `--force --delete-emptydir-data
   --ignore-daemonsets` for drain), then re-run the gate (a)+(b)+(c) in
@@ -235,6 +283,18 @@ NON-NEGOTIABLE
 _DESTRUCTIVE_NAME_KEYWORDS = {
     "delete", "drain", "evict", "apply", "patch",
     "scale", "restart", "create", "update", "replace", "rollout",
+    # Run-anything / install tools (mcp-server-kubernetes exec_in_pod,
+    # kubectl_generic, *_helm_chart, cleanup; CloudWatch start/stop_*).
+    "exec", "generic", "install", "uninstall", "upgrade", "cleanup", "helm",
+    "start", "stop",
+}
+
+# Always gated, whatever their description says. kubectl_generic can run any
+# kubectl command (including delete) and exec_in_pod any shell command, so
+# leaving them ungated would bypass the approval gate entirely.
+_ALWAYS_GATED = {
+    "kubectl_generic", "exec_in_pod", "node_management", "port_forward", "cleanup",
+    "install_helm_chart", "upgrade_helm_chart", "uninstall_helm_chart",
 }
 
 # Keywords in a tool DESCRIPTION that signal it is destructive
@@ -268,7 +328,7 @@ def _build_interrupt_on(mcp_tools: list) -> dict:
         name_match = bool(name_tokens & _DESTRUCTIVE_NAME_KEYWORDS)
         desc_match = any(kw in desc_lower for kw in _DESTRUCTIVE_DESC_KEYWORDS)
 
-        if name_match or desc_match:
+        if name_match or desc_match or tool.name in _ALWAYS_GATED:
             # Explicit allowed_decisions list (instead of `True`) so the
             # MORE DETAILS Slack button can resume with decision="respond".
             # The shorthand `True` only enables ["approve", "edit", "reject"];
@@ -339,6 +399,22 @@ def _wrap_with_error_handling(tool):
 
 CLUSTER_SKILL_PATH = os.environ.get("CLUSTER_SKILL_PATH", "")
 
+# Repo root that holds AGENTS.md and skills/. Defaults to the folder above
+# agent/ (= /app in the EKS image, the repo root when run locally), so it works
+# whatever the current working directory is. Override with HARNESS_ROOT.
+HARNESS_ROOT = os.path.abspath(
+    os.environ.get("HARNESS_ROOT")
+    or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+
+def _harness_path(local_path: str) -> str:
+    """Map a repo-relative path (./skills/clusters/x/SKILL.md) to /harness/..."""
+    if not os.path.isabs(local_path):
+        local_path = os.path.join(HARNESS_ROOT, local_path)
+    rel = os.path.relpath(os.path.normpath(local_path), HARNESS_ROOT)
+    return "/harness/" + rel.replace(os.sep, "/")
+
 # Per-call hard cap on LLM HTTP requests. Without this the OpenAI / Anthropic
 # SDKs default to a multi-minute timeout, so a stalled stream pins the worker
 # thread for ~10 minutes before any retry kicks in. 90s is generous for a single
@@ -355,7 +431,7 @@ def _build_model_with_timeout(model_spec: str):
         # agent still runs. Log loudly so it's discoverable.
         logger.warning(
             "AGENT_MODEL=%r has no provider prefix — passing through without "
-            "timeout/retry config. Use 'openai:gpt-5-mini' or 'anthropic:claude-...'.",
+            "timeout/retry config. Use 'openai:gpt-5.4-mini', 'anthropic:...' or 'bedrock_converse:...'.",
             model_spec,
         )
         return model_spec
@@ -408,7 +484,31 @@ async def build_agent_async():
     event loop so that MCP tool HTTP sessions are bound to that loop.
     """
     checkpointer = await _build_checkpointer()
-    store = await build_memory_store_async()
+
+    # Seed the file-based memory directory before building the agent so the
+    # FilesystemBackend finds an existing incidents.md on first read.
+    _seed_memory_dir()
+
+    # File-based memory backend:
+    #   /memories/** → FilesystemBackend (persistent incident log on disk)
+    #   everything else → StateBackend (scratch workspace per thread)
+    backend = CompositeBackend(
+        default=StateBackend(),
+        routes={
+            "/memories/": FilesystemBackend(
+                root_dir=MEMORY_DIR,
+                virtual_mode=True,
+            ),
+            # Harness files (AGENTS.md, skills/, cluster skill) live on disk in
+            # the image. Without this route they resolve against StateBackend,
+            # which is empty, so the agent silently starts with no skills and
+            # no AGENTS.md.
+            "/harness/": FilesystemBackend(
+                root_dir=HARNESS_ROOT,
+                virtual_mode=True,
+            ),
+        },
+    )
 
     # Load MCP tools inside the persistent loop — sessions remain valid.
     raw_tools = await get_mcp_tools_async()
@@ -430,36 +530,31 @@ async def build_agent_async():
         )
 
     model = _build_model_with_timeout(
-        os.environ.get("AGENT_MODEL", "openai:gpt-5-mini")
+        os.environ.get("AGENT_MODEL", "openai:gpt-5.4-mini")
     )
 
     agent = create_deep_agent(
         model=model,
-        skills=["./skills/universal/"],
+        backend=backend,
+        skills=["/harness/skills/universal/"],
         subagents=build_subagents(mcp_tools),
         tools=[
             post_to_slack,
             post_approval_request,
             mark_stand_down,
-            save_incident_to_memory,
             *mcp_tools,
         ],
         middleware=[
-            # Logs input/output/cache_read tokens after every model call so
-            # cost regressions are visible. Outermost in the user-middleware
-            # block — runs after the model returns, before any other
-            # post-processing.
             TokenUsageLoggingMiddleware(label="master"),
             KeepLoopingMiddleware(set(interrupt_on.keys())),
         ],
         checkpointer=checkpointer,
-        store=store,
         interrupt_on=interrupt_on,
         memory=(
-            ["./AGENTS.md"]
-            + ([CLUSTER_SKILL_PATH] if CLUSTER_SKILL_PATH else [])
+            ["/harness/AGENTS.md"]
+            + ([_harness_path(CLUSTER_SKILL_PATH)] if CLUSTER_SKILL_PATH else [])
         ),
         system_prompt=SYSTEM_PROMPT,
     )
 
-    return agent, store
+    return agent

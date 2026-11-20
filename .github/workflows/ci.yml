@@ -1,0 +1,105 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: ["**"]
+    tags: ["agent-v*", "mcp-v*"]   # agent-v119 -> k8s-deep-agent:v119, mcp-v3 -> k8s-mcp-gateway:v3
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Python compiles
+        run: python -m compileall -q agent evals-agentcore/scripts evals-agentcore/replay_lambda evals-agentcore/k8sHarness/app tests
+
+      - name: Shell scripts parse
+        run: for f in infra/*.sh evals-agentcore/scripts/*.sh tests/smoke/*.sh; do bash -n "$f"; done
+
+      - name: requirements.txt matches requirements.in
+        run: |
+          cd agent
+          # Compile onto a copy of the lock: uv keeps existing pins, so this only fails when
+          # requirements.in changed without re-locking (not when upstream ships a new release).
+          cp requirements.txt /tmp/req.txt
+          uv pip compile requirements.in -o /tmp/req.txt --python-version 3.11 --python-platform linux -q
+          diff <(grep -v '^#' requirements.txt) <(grep -v '^#' /tmp/req.txt) \
+            || { echo "::error::agent/requirements.txt is stale: re-run the uv pip compile command in requirements.in"; exit 1; }
+
+      - name: Lab variants sync (as-shipped has the bug, fixed doesn't)
+        run: |
+          cd evals-agentcore
+          ./scripts/sync_agent.sh as-shipped
+          ! grep -q '/harness/' k8sHarness/app/k8s_agent/agent_src/agent.py
+          ./scripts/sync_agent.sh fixed
+          diff k8sHarness/app/k8s_agent/agent_src/agent.py ../agent/agent.py
+
+      - name: EKS manifests render and parse
+        run: |
+          CLUSTER_NAME=ci AWS_REGION=us-east-1 CLUSTER_SKILL=skills/clusters/example/SKILL.md RENDER_ONLY=1 \
+            ./infra/deploy.sh > /tmp/rendered.yaml
+          ! grep -n '__[A-Z_]*__' /tmp/rendered.yaml
+          uv run --with pyyaml python -c "import yaml,sys; [d for d in yaml.safe_load_all(open('/tmp/rendered.yaml'))]"
+
+      - name: No account IDs committed
+        run: |
+          ! git grep -nIE '\b[0-9]{12}\b' -- ':!*.lock' ':!*package-lock.json' ':!agent/requirements.txt' \
+            | grep -vE '000000000000|sha256|integrity'
+
+  smoke:
+    runs-on: ubuntu-latest
+    needs: checks
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images
+        run: |
+          docker build -t k8s-deep-agent:test -f agent/Dockerfile .
+          docker build -t k8s-mcp-gateway:test -f infra/mcp-gateway.Dockerfile .
+      - name: Agent + replayed incident (tools, approval gate)
+        run: tests/smoke/run.sh tools
+      - name: Agent + real MCP sidecars (real tool names)
+        run: tests/smoke/run.sh sidecars
+
+  publish:
+    # Multi-arch push on a release tag. Needs repo secrets DOCKERHUB_USERNAME and
+    # DOCKERHUB_TOKEN; images go to <DOCKERHUB_NAMESPACE or DOCKERHUB_USERNAME>/<image>.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    needs: smoke
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick image and tag
+        id: pick
+        env:
+          NS: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
+        run: |
+          ref="${GITHUB_REF_NAME}"
+          [ -n "$NS" ] || { echo "::error::set the DOCKERHUB_USERNAME secret"; exit 1; }
+          case "$ref" in
+            agent-v*) echo "image=$NS/k8s-deep-agent:${ref#agent-}" >> "$GITHUB_OUTPUT"; echo "file=agent/Dockerfile" >> "$GITHUB_OUTPUT" ;;
+            mcp-v*)   echo "image=$NS/k8s-mcp-gateway:${ref#mcp-}" >> "$GITHUB_OUTPUT"; echo "file=infra/mcp-gateway.Dockerfile" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ steps.pick.outputs.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.pick.outputs.image }}
+          build-args: VERSION=${{ github.ref_name }}
